@@ -14,3 +14,6 @@ COPY . .
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/workspace/target \
     cargo check --workspace --all-targets --target x86_64-pc-windows-gnu --locked
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/workspace/target \
+    cargo clippy --workspace --all-targets --target x86_64-pc-windows-gnu --locked -- -D warnings

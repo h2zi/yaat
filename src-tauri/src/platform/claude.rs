@@ -775,7 +775,7 @@ impl OsCredentialStore {
             let inner =
                 keyring_core::Entry::new_with_modifiers(&key.service, &key.account, &modifiers)
                     .map_err(|error| format!("unable to open the OS credential entry: {error}"))?;
-            return Ok(keyring::Entry { inner });
+            Ok(keyring::Entry { inner })
         }
         #[cfg(not(windows))]
         {
