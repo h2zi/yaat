@@ -2211,12 +2211,16 @@ mod tests {
 
     #[test]
     fn helper_protocol_is_quoted_and_contains_only_a_reference() {
-        let command = credential_helper_command(
-            Path::new("/Applications/Yet Another Account Tool/yaat"),
-            "credential-ref_1",
-        )
-        .unwrap();
+        #[cfg(windows)]
+        let executable = Path::new(r"C:\Program Files\Yet Another Account Tool\yaat.exe");
+        #[cfg(not(windows))]
+        let executable = Path::new("/Applications/Yet Another Account Tool/yaat");
+
+        let command = credential_helper_command(executable, "credential-ref_1").unwrap();
         assert!(command.contains("--yaat-credential-helper claude_code credential-ref_1"));
+        #[cfg(windows)]
+        assert!(command.starts_with('"'));
+        #[cfg(not(windows))]
         assert!(command.starts_with('\''));
     }
 

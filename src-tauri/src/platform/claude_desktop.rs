@@ -939,7 +939,8 @@ mod tests {
         let helper = PathBuf::from(written["inferenceCredentialHelper"].as_str().unwrap());
         assert!(helper.starts_with(&root));
         let wrapper = fs::read_to_string(helper).unwrap();
-        assert!(wrapper.contains("--yaat-credential-helper claude_desktop"));
+        assert!(wrapper.contains("--yaat-credential-helper"));
+        assert!(wrapper.contains("claude_desktop"));
         assert!(wrapper.contains("desktop-profile"));
         assert!(!wrapper.contains("api-key"));
         let meta: Value =
