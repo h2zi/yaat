@@ -1,0 +1,67 @@
+[package]
+name = "yaat"
+version.workspace = true
+description = "Yet Another Account Tool"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[lib]
+# The `_lib` suffix avoids a library/binary name collision on Windows.
+# See https://github.com/rust-lang/cargo/issues/8519.
+name = "yaat_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2.6.3", features = [] }
+
+[dependencies]
+aes = "0.8"
+aes-gcm = "0.10"
+age = "0.12.1"
+base64 = "0.22"
+cbc = "0.1"
+chrono = "0.4"
+chrono-tz = "0.10"
+directories = "6"
+getrandom = "0.3"
+hex = "0.4"
+jsonc-parser = { version = "0.33.1", features = ["cst"] }
+keyring = { version = "4.1.6", features = ["apple-native-keyring-store", "windows-native-keyring-store"] }
+keyring-core = "1.0"
+pbkdf2 = "0.12"
+rusqlite = { version = "0.40.1", features = ["bundled"] }
+secrecy = "0.10"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha1 = "0.10"
+sha2 = "0.10"
+shell-escape = "0.1"
+tauri = { version = "2.11.5", features = [] }
+tauri-plugin-single-instance = "2.4.3"
+tauri-plugin-updater = "2.10.1"
+thiserror = "2"
+tokio = { version = "1", features = ["macros", "sync"] }
+toml_edit = { version = "0.25.13", features = ["serde"] }
+unicode-normalization = "0.1"
+url = "2"
+uuid = { version = "1", features = ["v4", "serde"] }
+walkdir = "2"
+which = "8"
+yaat-contracts = { path = "../crates/yaat-contracts" }
+zeroize = { version = "1", features = ["derive"] }
+zstd = "0.13"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+  "Win32_Foundation",
+  "Win32_Security_Cryptography",
+  "Win32_Storage_FileSystem",
+] }
+
+[dev-dependencies]
+pretty_assertions = "1"
+tempfile = "3"

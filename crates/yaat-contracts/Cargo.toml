@@ -1,0 +1,13 @@
+[package]
+name = "yaat-contracts"
+version.workspace = true
+description = "Shared IPC contracts for YAAT"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }

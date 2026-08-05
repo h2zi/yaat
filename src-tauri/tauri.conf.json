@@ -1,0 +1,54 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "YAAT",
+  "version": "0.1.0",
+  "identifier": "yet.another.account.tool",
+  "build": {
+    "beforeDevCommand": "pnpm run dev",
+    "devUrl": "http://localhost:1420",
+    "beforeBuildCommand": "pnpm run build",
+    "frontendDist": "../dist",
+    "removeUnusedCommands": true
+  },
+  "app": {
+    "withGlobalTauri": false,
+    "windows": [
+      {
+        "label": "main",
+        "title": "Yet Another Account Tool",
+        "width": 1180,
+        "height": 760,
+        "minWidth": 960,
+        "minHeight": 640,
+        "center": true
+      }
+    ]
+  },
+  "bundle": {
+    "active": true,
+    "createUpdaterArtifacts": true,
+    "targets": "all",
+    "publisher": "YAAT Contributors",
+    "category": "DeveloperTool",
+    "shortDescription": "Codex、Claude Code 与 Claude Desktop 多账号管理 / Multi-account manager for Codex, Claude Code, and Claude Desktop",
+    "longDescription": "YAAT 是一款面向 Codex、Claude Code 与 Claude Desktop 的本地 AI 多账号管理工具，并提供 Codex / Claude Code 本地用量统计。 / YAAT is a local multi-account manager for Codex, Claude Code, and Claude Desktop, with local usage tracking for Codex and Claude Code.",
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.icns",
+      "icons/icon.ico"
+    ]
+  },
+  "plugins": {
+    "updater": {
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDdCM0I2QTA3Nzg5QUM4MzcKUldRM3lKcDRCMm83ZXlZRGhNN25rbHV1ZkxLSzhFd1pFL2tlNURtVStTN2ZtUmlYbHVHbFQvY0oK",
+      "endpoints": [
+        "https://github.com/h2zi/yaat/releases/latest/download/latest.json"
+      ],
+      "windows": {
+        "installMode": "passive"
+      }
+    }
+  }
+}

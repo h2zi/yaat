@@ -1,0 +1,14 @@
+.DS_Store
+.git
+.idea
+.tauri-scaffold
+dist
+target
+tmp
+node_modules
+.pnpm-store
+**/dist
+**/target
+**/tmp
+**/node_modules
+*.log
