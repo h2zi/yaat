@@ -70,7 +70,7 @@ pub fn database_path() -> AppResult<PathBuf> {
     Ok(app_data_dir()?.join("yaat.sqlite3"))
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, test))]
 pub fn database_auxiliary_paths(database: &Path) -> [PathBuf; 2] {
     let mut wal = database.as_os_str().to_os_string();
     wal.push("-wal");
