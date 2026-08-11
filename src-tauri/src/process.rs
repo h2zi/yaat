@@ -12,12 +12,28 @@ use crate::error::{AppError, AppResult};
 
 const MAX_COMMAND_OUTPUT_BYTES: u64 = 64 * 1024;
 
+/// Prevent background probes and helper commands from creating a transient
+/// console window when YAAT is running as a Windows GUI application.
+pub fn configure_background(command: &mut Command) {
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        command.creation_flags(CREATE_NO_WINDOW);
+    }
+    #[cfg(not(windows))]
+    let _ = command;
+}
+
 pub fn run_with_timeout(
     program: &Path,
     args: &[&str],
     timeout: Duration,
 ) -> Result<(ExitStatus, Vec<u8>, Vec<u8>), String> {
-    let mut child = Command::new(program)
+    let mut command = Command::new(program);
+    configure_background(&mut command);
+    let mut child = command
         .args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -114,7 +130,9 @@ pub fn is_client_running(platform: Platform) -> AppResult<bool> {
         Platform::ClaudeCode => "claude.exe",
         Platform::ClaudeDesktop => "Claude.exe",
     };
-    let output = Command::new("tasklist")
+    let mut command = Command::new("tasklist");
+    configure_background(&mut command);
+    let output = command
         .args([
             "/FI",
             &format!("IMAGENAME eq {image_name}"),
@@ -135,9 +153,12 @@ pub fn is_client_running(platform: Platform) -> AppResult<bool> {
 }
 
 pub fn ensure_codex_history_clients_stopped() -> AppResult<()> {
-    if is_process_running(&["codex", "Codex"], &["codex.exe", "Codex.exe"])? {
+    if is_process_running(
+        &["codex", "Codex", "ChatGPT"],
+        &["codex.exe", "Codex.exe", "ChatGPT.exe"],
+    )? {
         return Err(AppError::ConfigConflict(
-            "Codex CLI or Codex Desktop is running; close it before unifying session history"
+            "Codex CLI or Codex Desktop is running; close it before writing unified session history"
                 .into(),
         ));
     }
@@ -180,7 +201,9 @@ fn is_process_running(unix_names: &[&str], _windows_names: &[&str]) -> AppResult
 
 #[cfg(windows)]
 fn is_process_running(_unix_names: &[&str], windows_names: &[&str]) -> AppResult<bool> {
-    let output = Command::new("tasklist")
+    let mut command = Command::new("tasklist");
+    configure_background(&mut command);
+    let output = command
         .args(["/FO", "CSV", "/NH"])
         .stdin(Stdio::null())
         .stderr(Stdio::null())

@@ -91,6 +91,8 @@ pub fn backups_dir() -> AppResult<PathBuf> {
 }
 
 pub fn ensure_private_directory(path: &Path) -> AppResult<()> {
+    #[cfg(windows)]
+    let already_existed = path.is_dir();
     std::fs::create_dir_all(path)?;
     #[cfg(unix)]
     {
@@ -98,7 +100,9 @@ pub fn ensure_private_directory(path: &Path) -> AppResult<()> {
         std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))?;
     }
     #[cfg(windows)]
-    restrict_windows_acl(path, true)?;
+    if !already_existed {
+        restrict_windows_acl(path, true)?;
+    }
     Ok(())
 }
 
@@ -115,33 +119,46 @@ pub fn ensure_private_file(path: &Path) -> AppResult<()> {
 
 #[cfg(windows)]
 fn restrict_windows_acl(path: &Path, directory: bool) -> AppResult<()> {
-    use std::process::Command;
+    use std::process::{Command, Stdio};
+    use std::sync::OnceLock;
 
-    let identity = Command::new("whoami.exe")
-        .args(["/user", "/fo", "csv", "/nh"])
-        .output()
-        .map_err(AppError::io)?;
-    if !identity.status.success() {
-        return Err(AppError::Io(
-            "unable to resolve the current Windows user SID".into(),
-        ));
-    }
-    let output = String::from_utf8(identity.stdout)
-        .map_err(|_| AppError::Io("Windows user SID output is not UTF-8".into()))?;
-    let sid = output
-        .trim()
-        .rsplit_once(',')
-        .map(|(_, sid)| sid.trim().trim_matches('"'))
-        .filter(|sid| sid.starts_with("S-1-"))
-        .ok_or_else(|| AppError::Io("unable to parse the current Windows user SID".into()))?;
+    static USER_SID: OnceLock<Result<String, String>> = OnceLock::new();
+    let sid = USER_SID
+        .get_or_init(|| {
+            let mut identity_command = Command::new("whoami.exe");
+            crate::process::configure_background(&mut identity_command);
+            let identity = identity_command
+                .args(["/user", "/fo", "csv", "/nh"])
+                .stdin(Stdio::null())
+                .output()
+                .map_err(|error| error.to_string())?;
+            if !identity.status.success() {
+                return Err("unable to resolve the current Windows user SID".into());
+            }
+            let output = String::from_utf8(identity.stdout)
+                .map_err(|_| "Windows user SID output is not UTF-8".to_string())?;
+            output
+                .trim()
+                .rsplit_once(',')
+                .map(|(_, sid)| sid.trim().trim_matches('"').to_owned())
+                .filter(|sid| sid.starts_with("S-1-"))
+                .ok_or_else(|| "unable to parse the current Windows user SID".to_string())
+        })
+        .as_ref()
+        .map_err(|error| AppError::Io(error.clone()))?;
     let grant = if directory {
         format!("*{sid}:(OI)(CI)F")
     } else {
         format!("*{sid}:F")
     };
-    let status = Command::new("icacls.exe")
+    let mut acl_command = Command::new("icacls.exe");
+    crate::process::configure_background(&mut acl_command);
+    let status = acl_command
         .arg(path)
         .args(["/inheritance:r", "/grant:r", &grant])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
         .status()
         .map_err(AppError::io)?;
     if !status.success() {

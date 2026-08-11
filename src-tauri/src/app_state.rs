@@ -1,12 +1,12 @@
 //! Shared application state and platform-adapter selection.
 
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use yaat_contracts::{AppSettings, HistoryScope, Platform, ProviderProfile};
+use yaat_contracts::{AppSettings, CliStatus, HistoryScope, Platform, ProviderProfile};
 
 use crate::db::Repository;
 use crate::error::{AppError, AppResult};
@@ -23,9 +23,19 @@ pub struct AppState {
     history_cancelled: Arc<AtomicBool>,
     history_running: Arc<Mutex<HashSet<HistoryScope>>>,
     history_background_tokens: Arc<Mutex<HashMap<HistoryScope, Arc<AtomicBool>>>>,
+    cli_probes: Mutex<HashMap<Platform, CliProbe>>,
     codex: CodexAdapter,
     claude: ClaudeAdapter,
     claude_desktop: ClaudeDesktopAdapter,
+}
+
+#[derive(Clone, Debug)]
+pub struct CliProbe {
+    pub platform: Platform,
+    pub path: PathBuf,
+    pub status: CliStatus,
+    pub version: Option<String>,
+    pub error: Option<String>,
 }
 
 impl AppState {
@@ -37,8 +47,16 @@ impl AppState {
         }
         paths::ensure_private_directory(&paths::backups_dir()?)?;
         let database_path = paths::database_path()?;
+        #[cfg(windows)]
+        let database_existed = database_path.is_file();
         let repository = Repository::open(&database_path).map_err(AppError::from)?;
+        #[cfg(windows)]
+        if !database_existed {
+            paths::ensure_private_file(&database_path)?;
+        }
+        #[cfg(unix)]
         paths::ensure_private_file(&database_path)?;
+        #[cfg(unix)]
         for auxiliary in paths::database_auxiliary_paths(&database_path) {
             if auxiliary.exists() {
                 paths::ensure_private_file(&auxiliary)?;
@@ -50,6 +68,7 @@ impl AppState {
             history_cancelled: Arc::new(AtomicBool::new(false)),
             history_running: Arc::new(Mutex::new(HashSet::new())),
             history_background_tokens: Arc::new(Mutex::new(HashMap::new())),
+            cli_probes: Mutex::new(HashMap::new()),
             codex: CodexAdapter::new(),
             claude: ClaudeAdapter::new(),
             claude_desktop: ClaudeDesktopAdapter::new(),
@@ -107,6 +126,11 @@ impl AppState {
     }
 
     pub fn context(&self, platform: Platform, settings: &AppSettings) -> AdapterContext {
+        Self::context_for(platform, settings)
+            .expect("YAAT data root was resolved during application startup")
+    }
+
+    pub fn context_for(platform: Platform, settings: &AppSettings) -> AppResult<AdapterContext> {
         let (cli, root) = match platform {
             Platform::Codex => (
                 settings.codex_path.as_deref(),
@@ -118,10 +142,25 @@ impl AppState {
             ),
             Platform::ClaudeDesktop => (settings.claude_desktop_path.as_deref(), None),
         };
-        AdapterContext {
-            data_root: paths::app_data_dir().expect("YAAT data root was resolved at startup"),
+        Ok(AdapterContext {
+            data_root: paths::app_data_dir()?,
             explicit_cli_path: cli.map(PathBuf::from),
             explicit_config_root: root.map(PathBuf::from),
+        })
+    }
+
+    pub fn cached_cli_probe(&self, platform: Platform, path: &Path) -> Option<CliProbe> {
+        self.cli_probes
+            .lock()
+            .ok()?
+            .get(&platform)
+            .filter(|probe| probe.path == *path)
+            .cloned()
+    }
+
+    pub fn cache_cli_probe(&self, probe: CliProbe) {
+        if let Ok(mut probes) = self.cli_probes.lock() {
+            probes.insert(probe.platform, probe);
         }
     }
 

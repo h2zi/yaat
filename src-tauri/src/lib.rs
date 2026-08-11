@@ -40,6 +40,7 @@ pub fn run() {
                 let _ = window.set_focus();
             }
         }))
+        .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
         .setup(move |app| {
             let state = AppState::open()
@@ -50,6 +51,7 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             commands::bootstrap,
+            commands::cli_status_refresh,
             commands::app_update_check,
             commands::app_update_install,
             commands::app_update_cancel,

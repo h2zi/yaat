@@ -56,6 +56,12 @@ struct ScanState {
     invalid_files: u64,
 }
 
+#[derive(Clone, Copy)]
+struct HistoryIndex<'a> {
+    repository: Option<&'a Repository>,
+    use_cache: bool,
+}
+
 #[derive(Default)]
 struct CopyPlan {
     copies: Vec<CopyAction>,
@@ -163,12 +169,15 @@ pub(crate) fn apply_cancellable(
     progress: impl FnMut(OperationProgress),
 ) -> AppResult<HistoryApplyResult> {
     apply_with_repository(
-        None,
-        false,
+        HistoryIndex {
+            repository: None,
+            use_cache: false,
+        },
         scope,
         supplied_roots,
         target_group_id,
         cancelled,
+        || Ok(()),
         progress,
     )
 }
@@ -179,15 +188,19 @@ pub(crate) fn apply_incremental_cancellable(
     supplied_roots: Vec<HistoryRoot>,
     target_group_id: Option<&str>,
     cancelled: &AtomicBool,
+    before_write: impl FnMut() -> AppResult<()>,
     progress: impl FnMut(OperationProgress),
 ) -> AppResult<HistoryApplyResult> {
     apply_with_repository(
-        Some(repository),
-        true,
+        HistoryIndex {
+            repository: Some(repository),
+            use_cache: true,
+        },
         scope,
         supplied_roots,
         target_group_id,
         cancelled,
+        before_write,
         progress,
     )
 }
@@ -198,26 +211,30 @@ pub(crate) fn apply_full_indexed_cancellable(
     supplied_roots: Vec<HistoryRoot>,
     target_group_id: Option<&str>,
     cancelled: &AtomicBool,
+    before_write: impl FnMut() -> AppResult<()>,
     progress: impl FnMut(OperationProgress),
 ) -> AppResult<HistoryApplyResult> {
     apply_with_repository(
-        Some(repository),
-        false,
+        HistoryIndex {
+            repository: Some(repository),
+            use_cache: false,
+        },
         scope,
         supplied_roots,
         target_group_id,
         cancelled,
+        before_write,
         progress,
     )
 }
 
 fn apply_with_repository(
-    repository: Option<&Repository>,
-    use_cache: bool,
+    index: HistoryIndex<'_>,
     scope: HistoryScope,
     supplied_roots: Vec<HistoryRoot>,
     target_group_id: Option<&str>,
     cancelled: &AtomicBool,
+    mut before_write: impl FnMut() -> AppResult<()>,
     mut progress: impl FnMut(OperationProgress),
 ) -> AppResult<HistoryApplyResult> {
     progress(OperationProgress {
@@ -231,12 +248,38 @@ fn apply_with_repository(
             claude_desktop_groups_cancellable(supplied_roots, cancelled)?
         }
     };
+    let repository = index.repository;
     let cache = repository
-        .filter(|_| use_cache)
+        .filter(|_| index.use_cache)
         .map(|repository| load_history_cache(repository, scope))
         .transpose()?;
     let mut state = scan_cancellable(scope, roots, cache.as_ref(), cancelled, &mut progress)?;
     let target_index = resolve_target(&state, target_group_id)?;
+    let initial_plan = plan_copies(&state, target_index)?;
+    let needs_metadata_update =
+        scope == HistoryScope::Codex && state.files.iter().any(|file| file.needs_metadata_update);
+    let needs_state_database_update = scope == HistoryScope::Codex
+        && codex_state_databases_need_normalization(&state.roots, cancelled)?;
+
+    if !needs_metadata_update && !needs_state_database_update && initial_plan.copies.is_empty() {
+        if let Some(repository) = repository {
+            save_history_cache(repository, &state)?;
+        }
+        return Ok(HistoryApplyResult {
+            scope,
+            copied: 0,
+            metadata_updated: 0,
+            identical_files: initial_plan.identical_files,
+            conflicts: initial_plan.conflicts,
+            invalid_files: state.invalid_files,
+        });
+    }
+
+    // Discovery and planning are read-only and remain safe while the client is
+    // running. Enforce process preconditions only when the plan actually has
+    // something to write.
+    check_cancelled(cancelled)?;
+    before_write()?;
 
     let mut metadata_updated = 0u64;
     if scope == HistoryScope::Codex {
@@ -348,6 +391,48 @@ fn normalize_codex_state_databases(
         updated = updated.saturating_add(changed as u64);
     }
     Ok(updated)
+}
+
+fn codex_state_databases_need_normalization(
+    roots: &[HistoryRoot],
+    cancelled: &AtomicBool,
+) -> AppResult<bool> {
+    for root in roots {
+        check_cancelled(cancelled)?;
+        let path = root.path.join("state_5.sqlite");
+        if !path.exists() {
+            continue;
+        }
+        let connection = Connection::open_with_flags(
+            &path,
+            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )
+        .map_err(|error| {
+            AppError::ConfigConflict(format!(
+                "unable to inspect Codex state database {}: {error}",
+                path.display()
+            ))
+        })?;
+        connection
+            .busy_timeout(std::time::Duration::from_secs(5))
+            .map_err(|error| AppError::ConfigConflict(error.to_string()))?;
+        let needs_update = connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM threads WHERE model_provider <> ?1 OR model_provider IS NULL LIMIT 1)",
+                [CODEX_HISTORY_PROVIDER_ID],
+                |row| row.get::<_, bool>(0),
+            )
+            .map_err(|error| {
+                AppError::ConfigConflict(format!(
+                    "unable to inspect Codex state database {}: {error}",
+                    path.display()
+                ))
+            })?;
+        if needs_update {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 #[cfg(test)]
@@ -1288,6 +1373,78 @@ mod tests {
         let text = String::from_utf8(normalized).unwrap();
         assert_eq!(text.matches(CODEX_HISTORY_PROVIDER_ID).count(), 2);
         assert!(!text.contains("\"openai\""));
+    }
+
+    #[test]
+    fn write_guard_runs_after_read_only_history_scan() {
+        use std::cell::Cell;
+
+        let temp = tempfile::tempdir().unwrap();
+        let first = temp.path().join("first");
+        let second = temp.path().join("second");
+        let relative = Path::new("sessions/2026/08/03/rollout-test.jsonl");
+        let source = first.join(relative);
+        fs::create_dir_all(source.parent().unwrap()).unwrap();
+        fs::write(&source, codex_line("openai")).unwrap();
+        let scan_completed = Cell::new(false);
+
+        let error = apply_with_repository(
+            HistoryIndex {
+                repository: None,
+                use_cache: false,
+            },
+            HistoryScope::Codex,
+            vec![root("first", &first), root("second", &second)],
+            None,
+            &AtomicBool::new(false),
+            || {
+                assert!(scan_completed.get());
+                Err(AppError::ConfigConflict("client is running".into()))
+            },
+            |progress| {
+                if progress.phase == OperationPhase::Processing && progress.processed > 0 {
+                    scan_completed.set(true);
+                }
+            },
+        )
+        .unwrap_err();
+
+        assert!(matches!(error, AppError::ConfigConflict(_)));
+        assert!(fs::read_to_string(source).unwrap().contains("\"openai\""));
+        assert!(!second.join(relative).exists());
+    }
+
+    #[test]
+    fn read_only_history_scan_does_not_run_write_guard_when_nothing_changed() {
+        use std::cell::Cell;
+
+        let temp = tempfile::tempdir().unwrap();
+        let root_path = temp.path().join("only");
+        let source = root_path.join("sessions/2026/08/03/rollout-test.jsonl");
+        fs::create_dir_all(source.parent().unwrap()).unwrap();
+        fs::write(&source, codex_line(CODEX_HISTORY_PROVIDER_ID)).unwrap();
+        let guard_called = Cell::new(false);
+
+        let result = apply_with_repository(
+            HistoryIndex {
+                repository: None,
+                use_cache: false,
+            },
+            HistoryScope::Codex,
+            vec![root("only", &root_path)],
+            None,
+            &AtomicBool::new(false),
+            || {
+                guard_called.set(true);
+                Err(AppError::ConfigConflict("client is running".into()))
+            },
+            |_| {},
+        )
+        .unwrap();
+
+        assert!(!guard_called.get());
+        assert_eq!(result.copied, 0);
+        assert_eq!(result.metadata_updated, 0);
     }
 
     #[test]

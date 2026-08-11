@@ -330,6 +330,7 @@ function usage(request: UsageQueryRequest): UsageReport {
 export const previewApi = {
   operation,
   bootstrap: async () => copy(state),
+  refreshCliStatus: async () => copy(state.platforms),
   historySyncStatus: async () => copy(state.historySync),
   checkUpdate: async () => null,
   installUpdate: async (

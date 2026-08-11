@@ -7,6 +7,7 @@ import {
   useRef,
   useState,
 } from "react";
+import { open as openDialog } from "@tauri-apps/plugin-dialog";
 import {
   AlertCircle,
   AppWindow,
@@ -170,6 +171,7 @@ export default function App() {
   const [updateBusy, setUpdateBusy] = useState(false);
   const [updateCancelling, setUpdateCancelling] = useState(false);
   const bootstrapped = useRef(false);
+  const cliStatusProbeKey = useRef<string | null>(null);
   const updateChecked = useRef(false);
 
   const t = useCallback(
@@ -204,6 +206,31 @@ export default function App() {
   }, [refresh]);
 
   useEffect(() => {
+    if (!data) return;
+    const probeKey = data.platforms
+      .map((item) => `${item.platform}:${item.cliPath ?? ""}`)
+      .join("|");
+    if (cliStatusProbeKey.current === probeKey) return;
+    cliStatusProbeKey.current = probeKey;
+    let cancelled = false;
+    void api
+      .refreshCliStatus()
+      .then((platforms) => {
+        if (!cancelled) {
+          setData((current) => (current ? { ...current, platforms } : current));
+        }
+      })
+      .catch(() => {
+        if (!cancelled && cliStatusProbeKey.current === probeKey) {
+          cliStatusProbeKey.current = null;
+        }
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [data]);
+
+  useEffect(() => {
     const media = window.matchMedia("(prefers-color-scheme: dark)");
     const update = () => {
       if (data?.settings.theme === "auto") applyTheme("auto");
@@ -228,11 +255,16 @@ export default function App() {
     platformState?.cliStatus === "version_unknown";
   const platformDiagnostic = platformState
     ? [
-        platformState.cliVersion ||
+        `${t(
+          platform === "claude_desktop"
+            ? "appPathDiagnostic"
+            : "cliPathDiagnostic",
+        )}: ${
           platformState.cliPath ||
-          (platform === "claude_desktop" ? "Claude Desktop" : "CLI"),
+          (platform === "claude_desktop" ? "Claude Desktop" : "—")
+        }${platformState.cliVersion ? ` (${platformState.cliVersion})` : ""}`,
         platformState.cliStatus === "ready" ? null : platformState.cliError,
-        platformState.configRoot,
+        `${t("configPathDiagnostic")}: ${platformState.configRoot}`,
       ]
         .filter(Boolean)
         .join(" · ")
@@ -343,6 +375,22 @@ export default function App() {
       t("launched"),
       () => setPendingLaunch(null),
     );
+  };
+
+  const selectLaunchDirectory = async () => {
+    try {
+      const selected = await openDialog({
+        directory: true,
+        multiple: false,
+        title: t("selectProjectDirectory"),
+        defaultPath: launchCwd.trim() || undefined,
+      });
+      if (typeof selected === "string") setLaunchCwd(selected);
+    } catch (requestError) {
+      toast.error(t("errorTitle"), {
+        description: errorMessage(requestError),
+      });
+    }
   };
 
   const deleteProvider = async () => {
@@ -1012,13 +1060,27 @@ export default function App() {
           </DialogHeader>
           <div className="grid gap-2 py-1">
             <Label htmlFor="launch-cwd">{t("projectDirectory")}</Label>
-            <Input
-              id="launch-cwd"
-              autoFocus
-              value={launchCwd}
-              onChange={(event) => setLaunchCwd(event.target.value)}
-              placeholder={t("projectPathPlaceholder")}
-            />
+            <div className="flex gap-2">
+              <Input
+                id="launch-cwd"
+                className="min-w-0 flex-1"
+                autoFocus
+                value={launchCwd}
+                onChange={(event) => setLaunchCwd(event.target.value)}
+                placeholder={t("projectPathPlaceholder")}
+              />
+              <Button
+                type="button"
+                variant="outline"
+                size="icon"
+                disabled={busyAction === "launch"}
+                aria-label={t("selectProjectDirectory")}
+                title={t("selectProjectDirectory")}
+                onClick={() => void selectLaunchDirectory()}
+              >
+                <FolderOpen />
+              </Button>
+            </div>
           </div>
           <DialogFooter>
             <Button variant="ghost" onClick={() => setPendingLaunch(null)}>

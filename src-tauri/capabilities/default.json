@@ -5,6 +5,7 @@
   "windows": ["main"],
   "permissions": [
     "allow-bootstrap",
+    "allow-cli-status-refresh",
     "allow-app-update-check",
     "allow-app-update-install",
     "allow-app-update-cancel",
@@ -27,6 +28,7 @@
     "allow-history-preview",
     "allow-history-apply",
     "allow-history-cancel",
-    "allow-history-sync-status"
+    "allow-history-sync-status",
+    "dialog:allow-open"
   ]
 }

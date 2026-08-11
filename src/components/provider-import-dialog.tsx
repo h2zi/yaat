@@ -1,7 +1,6 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import {
   AlertTriangle,
-  CheckCircle2,
   LoaderCircle,
   Pencil,
   RefreshCw,
@@ -171,7 +170,6 @@ export function ProviderImportDialog({
             <div className="flex items-center justify-between gap-3 rounded-xl border border-border bg-muted/30 px-4 py-3">
               <div>
                 <p className="text-sm font-medium">{platformName(platform)}</p>
-                <p className="text-xs text-muted-foreground">{text.subtitle}</p>
               </div>
               <Button
                 type="button"
@@ -278,12 +276,7 @@ export function ProviderImportDialog({
                             ? text.helperUnsupported
                             : text.credentialRequired}
                         </div>
-                      ) : (
-                        <div className="flex items-center gap-2 text-xs text-emerald-700 dark:text-emerald-300">
-                          <CheckCircle2 className="size-3.5" />
-                          {text.credentialReady}
-                        </div>
-                      )}
+                      ) : null}
 
                       {candidate.warnings.map((warning) => (
                         <div
@@ -432,9 +425,8 @@ function kindLabel(kind: CreateProviderRequest["kind"], text: typeof zh) {
 
 const zh = {
   title: "导入当前账号与配置",
-  subtitle: "只读取当前全局配置；导入不会切换账号或修改客户端文件",
   rescan: "重新扫描",
-  scanning: "正在安全扫描当前配置与凭据…",
+  scanning: "正在扫描当前配置与凭据…",
   noneFound: "没有发现可导入的当前配置或官方登录凭据",
   select: "选择",
   active: "当前生效",
@@ -443,7 +435,6 @@ const zh = {
   review: "检查配置",
   reviewTitle: "检查导入配置",
   applyReview: "保存检查结果",
-  credentialReady: "凭据已安全检测，不会回显到界面",
   credentialRequired: "需要填写直接凭据后才能导入",
   helperUnsupported: "不会执行凭据 helper；请在检查配置中填写直接凭据",
   selectOne: "请至少选择一个可导入账号",
@@ -457,10 +448,8 @@ const zh = {
 
 const en: typeof zh = {
   title: "Import current accounts and configuration",
-  subtitle:
-    "Read-only scan; importing does not switch accounts or modify client files",
   rescan: "Rescan",
-  scanning: "Securely scanning the current configuration and credentials…",
+  scanning: "Scanning the current configuration and credentials…",
   noneFound:
     "No importable active configuration or official credential was found",
   select: "Select",
@@ -470,7 +459,6 @@ const en: typeof zh = {
   review: "Review",
   reviewTitle: "Review import configuration",
   applyReview: "Save review",
-  credentialReady: "Credential detected securely and not returned to the UI",
   credentialRequired: "Enter a direct credential before importing",
   helperUnsupported:
     "Credential helpers are not executed; enter a direct credential in Review",

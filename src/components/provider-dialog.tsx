@@ -402,64 +402,51 @@ export function ProviderDialog({
             </div>
           ) : null}
 
-          {kind === "official_subscription" ? (
+          {kind === "official_subscription" &&
+          !(credentialAvailable && mode === "create") ? (
             <div className="grid gap-2 rounded-xl border border-border bg-muted/35 p-4">
-              {credentialAvailable && mode === "create" ? (
-                <p className="text-sm text-muted-foreground">
-                  {language === "zh"
-                    ? "已安全检测到官方登录凭据，导入时不会把凭据发送到界面。"
-                    : "The official sign-in credential was detected securely and is not sent to the UI."}
-                </p>
-              ) : (
-                <>
-                  <div className="flex items-center justify-between gap-3">
-                    <Label htmlFor="official-credential">
-                      {t("officialCredential")}
-                    </Label>
-                    <Button
-                      type="button"
-                      variant="ghost"
-                      size="icon-sm"
-                      disabled={credentialLoading || !secret}
-                      aria-label={t(
-                        credentialCopied
-                          ? "credentialCopied"
-                          : "copyCredential",
-                      )}
-                      title={t(
-                        credentialCopied
-                          ? "credentialCopied"
-                          : "copyCredential",
-                      )}
-                      onClick={() => void copyCredential()}
-                    >
-                      {credentialLoading ? (
-                        <LoaderCircle className="animate-spin" />
-                      ) : credentialCopied ? (
-                        <Check />
-                      ) : (
-                        <Copy />
-                      )}
-                    </Button>
-                  </div>
-                  <Textarea
-                    id="official-credential"
-                    className="min-h-40 font-mono text-xs leading-relaxed"
-                    disabled={credentialLoading}
-                    spellCheck={false}
-                    value={secret}
-                    onChange={(event) => {
-                      setSecret(event.target.value);
-                      setCredentialCopied(false);
-                    }}
-                    placeholder={t(
-                      credentialLoading
-                        ? "credentialLoading"
-                        : "officialCredentialPlaceholder",
-                    )}
-                  />
-                </>
-              )}
+              <div className="flex items-center justify-between gap-3">
+                <Label htmlFor="official-credential">
+                  {t("officialCredential")}
+                </Label>
+                <Button
+                  type="button"
+                  variant="ghost"
+                  size="icon-sm"
+                  disabled={credentialLoading || !secret}
+                  aria-label={t(
+                    credentialCopied ? "credentialCopied" : "copyCredential",
+                  )}
+                  title={t(
+                    credentialCopied ? "credentialCopied" : "copyCredential",
+                  )}
+                  onClick={() => void copyCredential()}
+                >
+                  {credentialLoading ? (
+                    <LoaderCircle className="animate-spin" />
+                  ) : credentialCopied ? (
+                    <Check />
+                  ) : (
+                    <Copy />
+                  )}
+                </Button>
+              </div>
+              <Textarea
+                id="official-credential"
+                className="min-h-40 font-mono text-xs leading-relaxed"
+                disabled={credentialLoading}
+                spellCheck={false}
+                value={secret}
+                onChange={(event) => {
+                  setSecret(event.target.value);
+                  setCredentialCopied(false);
+                }}
+                placeholder={t(
+                  credentialLoading
+                    ? "credentialLoading"
+                    : "officialCredentialPlaceholder",
+                )}
+              />
             </div>
           ) : null}
 

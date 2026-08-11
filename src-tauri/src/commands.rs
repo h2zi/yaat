@@ -35,11 +35,12 @@ use crate::activation::{
     ConfigFormat, OwnedPath, PatchEngine, PatchOperation, PathChange, PathState, PreparedPatch,
     RollbackOutcome, remove_atomically, replace_atomically,
 };
-use crate::app_state::AppState;
+use crate::app_state::{AppState, CliProbe};
 use crate::db::{ProviderBatchInsert, ProviderBatchSensitiveRecord, SensitiveRecordKey};
 use crate::error::{AppError, AppResult};
 use crate::platform::{
-    CredentialSnapshot, CredentialState, DiscoveredProvider, ProfileRuntime, SidecarPlan,
+    CredentialSnapshot, CredentialState, DiscoveredProvider, PlatformAdapter, ProfileRuntime,
+    SidecarPlan, claude::ClaudeAdapter, claude_desktop::ClaudeDesktopAdapter, codex::CodexAdapter,
 };
 use crate::usage::service;
 use crate::{history, launcher, paths, process, updates, validation};
@@ -210,7 +211,36 @@ impl Drop for StoredGlobalBaseline {
 
 #[tauri::command]
 pub fn bootstrap(state: State<'_, AppState>) -> Result<BootstrapResponse, ApiError> {
+    for platform in Platform::ALL {
+        schedule_history_sync(&state, platform);
+    }
     api(bootstrap_inner(&state))
+}
+
+#[tauri::command]
+pub async fn cli_status_refresh(
+    state: State<'_, AppState>,
+) -> Result<Vec<PlatformState>, ApiError> {
+    let settings = state.repository.load_settings().map_err(AppError::from)?;
+    let probe_settings = settings.clone();
+    let probes = finish_background(tauri::async_runtime::spawn_blocking(move || {
+        probe_all_clients(&probe_settings)
+    }))
+    .await?;
+    let mut platforms = Vec::with_capacity(probes.len());
+    for probe in probes {
+        if let Some(path) = probe.path.as_ref() {
+            state.cache_cli_probe(CliProbe {
+                platform: probe.platform,
+                path: path.clone(),
+                status: probe.status,
+                version: probe.version.clone(),
+                error: probe.error.clone(),
+            });
+        }
+        platforms.push(platform_state_from_probe(&state, &settings, probe)?);
+    }
+    Ok(platforms)
 }
 
 #[tauri::command]
@@ -522,7 +552,7 @@ pub fn profile_launch(
                 None => binding_warning,
             });
         }
-        schedule_history_sync(&state, profile.platform, true);
+        schedule_history_sync(&state, profile.platform);
         Ok(operation("managed profile launched", warning))
     })())
 }
@@ -666,7 +696,6 @@ pub async fn history_apply(
     request: HistoryApplyRequest,
     on_progress: Channel<OperationProgress>,
 ) -> Result<HistoryApplyResult, ApiError> {
-    ensure_history_clients_stopped(request.scope).map_err(ApiError::from)?;
     let roots = history_roots(&state, request.scope).map_err(ApiError::from)?;
     let repository = Arc::clone(&state.repository);
     let status_repository = Arc::clone(&state.repository);
@@ -686,6 +715,7 @@ pub async fn history_apply(
             roots,
             request.target_group_id.as_deref(),
             &cancelled,
+            || ensure_history_clients_stopped(scope),
             move |progress| {
                 if scope == HistoryScope::Codex
                     && progress.phase == yaat_contracts::OperationPhase::Saving
@@ -950,7 +980,7 @@ fn activate_global(state: &AppState, profile: &ProviderProfile) -> AppResult<Ope
         )));
     }
 
-    schedule_history_sync(state, profile.platform, false);
+    schedule_history_sync(state, profile.platform);
     Ok(operation("global provider activated", credential_warning))
 }
 
@@ -1409,6 +1439,15 @@ fn global_baseline_record_id(platform: Platform) -> String {
     format!("global/{}/baseline", platform.as_str())
 }
 
+#[derive(Clone, Debug)]
+struct CliProbeResult {
+    platform: Platform,
+    path: Option<PathBuf>,
+    status: CliStatus,
+    version: Option<String>,
+    error: Option<String>,
+}
+
 fn bootstrap_inner(state: &AppState) -> AppResult<BootstrapResponse> {
     let profiles = state
         .repository
@@ -1418,51 +1457,36 @@ fn bootstrap_inner(state: &AppState) -> AppResult<BootstrapResponse> {
     let mut platforms = Vec::with_capacity(Platform::ALL.len());
     for platform in Platform::ALL {
         let context = state.context(platform, &settings);
-        let (cli_status, cli_path, cli_version, cli_error) =
-            match state.adapter(platform).resolve_cli(&context) {
-                Ok(path) => match state.adapter(platform).cli_version(&path) {
-                    Ok(version) => (
-                        CliStatus::Ready,
-                        Some(path.to_string_lossy().into_owned()),
-                        Some(version),
-                        None,
-                    ),
-                    Err(error) => (
-                        CliStatus::VersionUnknown,
-                        Some(path.to_string_lossy().into_owned()),
-                        None,
-                        Some(cli_error_summary(&error)),
-                    ),
+        let probe = match state.adapter(platform).resolve_cli(&context) {
+            Ok(path) => state.cached_cli_probe(platform, &path).map_or(
+                CliProbeResult {
+                    platform,
+                    path: Some(path),
+                    status: CliStatus::VersionUnknown,
+                    version: None,
+                    error: None,
                 },
-                Err(error) => (
-                    if context.explicit_cli_path.is_some() {
-                        CliStatus::Invalid
-                    } else {
-                        CliStatus::Missing
-                    },
-                    context
-                        .explicit_cli_path
-                        .as_ref()
-                        .map(|path| path.to_string_lossy().into_owned()),
-                    None,
-                    Some(cli_error_summary(&error)),
-                ),
-            };
-        platforms.push(PlatformState {
-            platform,
-            cli_status,
-            cli_path,
-            cli_version,
-            cli_error,
-            config_root: state
-                .config_root(platform, &settings)?
-                .to_string_lossy()
-                .into_owned(),
-            binding: state
-                .repository
-                .get_platform_binding(platform)
-                .map_err(AppError::from)?,
-        });
+                |cached| CliProbeResult {
+                    platform,
+                    path: Some(cached.path),
+                    status: cached.status,
+                    version: cached.version,
+                    error: cached.error,
+                },
+            ),
+            Err(error) => CliProbeResult {
+                platform,
+                path: context.explicit_cli_path.clone(),
+                status: if context.explicit_cli_path.is_some() {
+                    CliStatus::Invalid
+                } else {
+                    CliStatus::Missing
+                },
+                version: None,
+                error: Some(cli_error_summary(&error)),
+            },
+        };
+        platforms.push(platform_state_from_probe(state, &settings, probe)?);
     }
     Ok(BootstrapResponse {
         profiles,
@@ -1471,6 +1495,106 @@ fn bootstrap_inner(state: &AppState) -> AppResult<BootstrapResponse> {
         history_sync: state
             .repository
             .list_history_sync_status()
+            .map_err(AppError::from)?,
+    })
+}
+
+fn probe_all_clients(settings: &AppSettings) -> AppResult<Vec<CliProbeResult>> {
+    std::thread::scope(|scope| {
+        let handles =
+            Platform::ALL.map(|platform| scope.spawn(move || probe_client(settings, platform)));
+        let mut probes = Vec::with_capacity(handles.len());
+        for handle in handles {
+            probes.push(
+                handle.join().map_err(|_| {
+                    AppError::Internal("CLI version probe thread panicked".into())
+                })??,
+            );
+        }
+        Ok(probes)
+    })
+}
+
+fn probe_client(settings: &AppSettings, platform: Platform) -> AppResult<CliProbeResult> {
+    let context = AppState::context_for(platform, settings)?;
+    match platform {
+        Platform::Codex => probe_client_with(&CodexAdapter::new(), platform, &context),
+        Platform::ClaudeCode => probe_client_with(&ClaudeAdapter::new(), platform, &context),
+        Platform::ClaudeDesktop => {
+            probe_client_with(&ClaudeDesktopAdapter::new(), platform, &context)
+        }
+    }
+}
+
+fn probe_client_with(
+    adapter: &dyn PlatformAdapter,
+    platform: Platform,
+    context: &crate::platform::AdapterContext,
+) -> AppResult<CliProbeResult> {
+    let path = match adapter.resolve_cli(context) {
+        Ok(path) => path,
+        Err(error) => {
+            return Ok(CliProbeResult {
+                platform,
+                path: context.explicit_cli_path.clone(),
+                status: if context.explicit_cli_path.is_some() {
+                    CliStatus::Invalid
+                } else {
+                    CliStatus::Missing
+                },
+                version: None,
+                error: Some(cli_error_summary(&error)),
+            });
+        }
+    };
+
+    #[cfg(windows)]
+    if platform == Platform::ClaudeDesktop {
+        return Ok(CliProbeResult {
+            platform,
+            path: Some(path),
+            status: CliStatus::Ready,
+            version: None,
+            error: None,
+        });
+    }
+
+    Ok(match adapter.cli_version(&path) {
+        Ok(version) => CliProbeResult {
+            platform,
+            path: Some(path),
+            status: CliStatus::Ready,
+            version: Some(version),
+            error: None,
+        },
+        Err(error) => CliProbeResult {
+            platform,
+            path: Some(path),
+            status: CliStatus::VersionUnknown,
+            version: None,
+            error: Some(cli_error_summary(&error)),
+        },
+    })
+}
+
+fn platform_state_from_probe(
+    state: &AppState,
+    settings: &AppSettings,
+    probe: CliProbeResult,
+) -> AppResult<PlatformState> {
+    Ok(PlatformState {
+        platform: probe.platform,
+        cli_status: probe.status,
+        cli_path: probe.path.map(|path| path.to_string_lossy().into_owned()),
+        cli_version: probe.version,
+        cli_error: probe.error,
+        config_root: state
+            .config_root(probe.platform, settings)?
+            .to_string_lossy()
+            .into_owned(),
+        binding: state
+            .repository
+            .get_platform_binding(probe.platform)
             .map_err(AppError::from)?,
     })
 }
@@ -2255,7 +2379,7 @@ fn claude_desktop_history_roots(state: &AppState) -> AppResult<Vec<history::Hist
         .collect()
 }
 
-fn schedule_history_sync(state: &AppState, platform: Platform, wait_for_exit: bool) {
+fn schedule_history_sync(state: &AppState, platform: Platform) {
     let scope = history_scope(platform);
     let settings = match state.repository.load_settings() {
         Ok(settings) => settings,
@@ -2290,6 +2414,7 @@ fn schedule_history_sync(state: &AppState, platform: Platform, wait_for_exit: bo
         .then_some(settings.claude_desktop_history_target)
         .flatten();
     let repository = Arc::clone(&state.repository);
+    let waiting_repository = Arc::clone(&state.repository);
     let cancelled = task.cancelled();
     let _ = repository.save_history_sync_status(&HistorySyncStatus {
         scope,
@@ -2297,28 +2422,12 @@ fn schedule_history_sync(state: &AppState, platform: Platform, wait_for_exit: bo
         ..HistorySyncStatus::default()
     });
     tauri::async_runtime::spawn_blocking(move || {
-        if wait_for_exit {
-            for _ in 0..120 {
-                if cancelled.load(std::sync::atomic::Ordering::Acquire) {
-                    break;
-                }
-                if ensure_history_clients_stopped(scope).is_ok() {
-                    break;
-                }
-                std::thread::sleep(Duration::from_secs(1));
-            }
-        }
         let result = if cancelled.load(std::sync::atomic::Ordering::Acquire) {
             Err(AppError::Cancelled)
         } else {
-            ensure_history_clients_stopped(scope).and_then(|()| {
-                let current = repository.load_settings().map_err(AppError::from)?;
-                let still_enabled = match scope {
-                    HistoryScope::Codex => current.unify_codex_history,
-                    HistoryScope::ClaudeCode => current.unify_claude_code_history,
-                    HistoryScope::ClaudeDesktopCode => current.unify_claude_desktop_code_history,
-                };
-                if !still_enabled {
+            let current = repository.load_settings().map_err(AppError::from);
+            current.and_then(|current| {
+                if !history_sync_enabled(&current, scope) {
                     return Err(AppError::Cancelled);
                 }
                 let _ = repository.save_history_sync_status(&HistorySyncStatus {
@@ -2333,6 +2442,20 @@ fn schedule_history_sync(state: &AppState, platform: Platform, wait_for_exit: bo
                     roots,
                     target.as_deref(),
                     &cancelled,
+                    || {
+                        let _ = waiting_repository.save_history_sync_status(&HistorySyncStatus {
+                            scope,
+                            state: HistorySyncState::Queued,
+                            ..HistorySyncStatus::default()
+                        });
+                        wait_for_history_write_access(scope, &cancelled)?;
+                        let current = repository.load_settings().map_err(AppError::from)?;
+                        if history_sync_enabled(&current, scope) {
+                            Ok(())
+                        } else {
+                            Err(AppError::Cancelled)
+                        }
+                    },
                     |progress| {
                         if scope == HistoryScope::Codex
                             && progress.phase == yaat_contracts::OperationPhase::Saving
@@ -2376,6 +2499,32 @@ fn schedule_history_sync(state: &AppState, platform: Platform, wait_for_exit: bo
         let _ = repository.save_history_sync_status(&status);
         drop(task);
     });
+}
+
+fn history_sync_enabled(settings: &AppSettings, scope: HistoryScope) -> bool {
+    match scope {
+        HistoryScope::Codex => settings.unify_codex_history,
+        HistoryScope::ClaudeCode => settings.unify_claude_code_history,
+        HistoryScope::ClaudeDesktopCode => settings.unify_claude_desktop_code_history,
+    }
+}
+
+fn wait_for_history_write_access(
+    scope: HistoryScope,
+    cancelled: &std::sync::atomic::AtomicBool,
+) -> AppResult<()> {
+    loop {
+        if cancelled.load(std::sync::atomic::Ordering::Acquire) {
+            return Err(AppError::Cancelled);
+        }
+        match ensure_history_clients_stopped(scope) {
+            Ok(()) => return Ok(()),
+            Err(AppError::ConfigConflict(_)) => {
+                std::thread::sleep(Duration::from_secs(1));
+            }
+            Err(error) => return Err(error),
+        }
+    }
 }
 
 fn truncate_error(value: &str) -> String {

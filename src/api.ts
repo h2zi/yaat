@@ -16,6 +16,7 @@ import type {
   OperationProgress,
   OperationResult,
   Platform,
+  PlatformState,
   ProviderCredentialResponse,
   ProviderImportCommitRequest,
   ProviderImportPreview,
@@ -33,6 +34,7 @@ const preview = import.meta.env.VITE_YAAT_PREVIEW === "1";
 
 const commands = {
   bootstrap: "bootstrap",
+  refreshCliStatus: "cli_status_refresh",
   checkUpdate: "app_update_check",
   installUpdate: "app_update_install",
   cancelUpdate: "app_update_cancel",
@@ -113,6 +115,11 @@ async function requestWithProgress<T>(
 export const api = {
   bootstrap: (): Promise<BootstrapResponse> =>
     preview ? previewApi.bootstrap() : request(commands.bootstrap),
+
+  refreshCliStatus: (): Promise<PlatformState[]> =>
+    preview
+      ? previewApi.refreshCliStatus()
+      : request(commands.refreshCliStatus),
 
   checkUpdate: (): Promise<ReleaseUpdate | null> =>
     preview ? previewApi.checkUpdate() : request(commands.checkUpdate),

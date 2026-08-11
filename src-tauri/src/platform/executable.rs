@@ -99,11 +99,22 @@ fn resolve_with(
             }
             path.to_path_buf()
         };
-        return validate_candidate(&candidate, program);
+        return validate_candidate_for_host(&candidate, program, host);
+    }
+
+    // The desktop app's relocated cache is a normal user executable. Resolve
+    // it before PATH because Microsoft Store app execution aliases may point
+    // back into the protected WindowsApps package.
+    if host == HostPlatform::Windows && program == CliProgram::Codex {
+        for candidate in windows_codex_desktop_cli_candidates(data_local_dir) {
+            if let Ok(path) = validate_candidate_for_host(&candidate, program, host) {
+                return Ok(path);
+            }
+        }
     }
 
     if let Ok(path) = find_on_path(program.executable_name(), search_path, home)
-        && let Ok(path) = validate_candidate(&path, program)
+        && let Ok(path) = validate_candidate_for_host(&path, program, host)
     {
         return Ok(path);
     }
@@ -111,16 +122,48 @@ fn resolve_with(
     let mut inspected = HashSet::new();
     for candidate in candidate_paths(program, home, data_dir, data_local_dir, host) {
         if inspected.insert(candidate.clone())
-            && let Ok(path) = validate_candidate(&candidate, program)
+            && let Ok(path) = validate_candidate_for_host(&candidate, program, host)
         {
             return Ok(path);
         }
+    }
+
+    if host == HostPlatform::Windows
+        && program == CliProgram::Codex
+        && windows_codex_msix_package_present(data_local_dir)
+    {
+        return Err(
+            "An OpenAI desktop app is installed from Microsoft Store, but no runnable Codex CLI cache was found; open ChatGPT/Codex once to initialize Codex, or configure a standalone Codex CLI path"
+                .into(),
+        );
     }
 
     Err(format!(
         "{} was not found in PATH or a supported installation directory",
         program.display_name()
     ))
+}
+
+fn validate_candidate_for_host(
+    path: &Path,
+    program: CliProgram,
+    host: HostPlatform,
+) -> Result<PathBuf, String> {
+    if host == HostPlatform::Windows
+        && program == CliProgram::Codex
+        && path.components().any(|component| {
+            component
+                .as_os_str()
+                .to_string_lossy()
+                .eq_ignore_ascii_case("WindowsApps")
+        })
+    {
+        return Err(format!(
+            "Codex executable {} is inside the protected WindowsApps package; use the desktop CLI cache or a standalone CLI instead",
+            path.display()
+        ));
+    }
+    validate_candidate(path, program)
 }
 
 fn find_on_path(
@@ -203,10 +246,20 @@ fn candidate_paths(
     }
 
     let names = executable_names(program, host);
-    let mut paths = directories
+    let ordinary_paths = directories
         .into_iter()
         .flat_map(|directory| names.iter().map(move |name| directory.join(name)))
         .collect::<Vec<_>>();
+
+    // The Microsoft Store alias can resolve to the protected MSIX package and
+    // fail when executed outside the app container. Prefer the desktop app's
+    // relocated, user-executable CLI cache before ordinary Windows candidates.
+    let mut paths = if host == HostPlatform::Windows && program == CliProgram::Codex {
+        windows_codex_desktop_cli_candidates(data_local_dir)
+    } else {
+        Vec::new()
+    };
+    paths.extend(ordinary_paths);
 
     if host == HostPlatform::Macos && program == CliProgram::Codex {
         for application_root in [PathBuf::from("/Applications"), home.join("Applications")] {
@@ -227,6 +280,78 @@ fn candidate_paths(
         }
     }
     paths
+}
+
+fn windows_codex_desktop_cli_candidates(data_local_dir: &Path) -> Vec<PathBuf> {
+    let mut bin_directories = Vec::new();
+    for product in ["Codex", "ChatGPT"] {
+        bin_directories.push(data_local_dir.join("OpenAI").join(product).join("bin"));
+    }
+    for package_root in windows_codex_msix_package_roots(data_local_dir) {
+        for product in ["Codex", "ChatGPT"] {
+            bin_directories.push(
+                package_root
+                    .join("LocalCache")
+                    .join("Local")
+                    .join("OpenAI")
+                    .join(product)
+                    .join("bin"),
+            );
+        }
+    }
+
+    let mut candidates = Vec::new();
+    for bin in bin_directories {
+        candidates.push(bin.join("codex.exe"));
+        let Ok(entries) = fs::read_dir(&bin) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                candidates.push(path.join("codex.exe"));
+            }
+        }
+    }
+    candidates.sort_by(|left, right| {
+        let left_modified = fs::metadata(left)
+            .and_then(|metadata| metadata.modified())
+            .ok();
+        let right_modified = fs::metadata(right)
+            .and_then(|metadata| metadata.modified())
+            .ok();
+        right_modified
+            .cmp(&left_modified)
+            .then_with(|| right.cmp(left))
+    });
+    candidates
+}
+
+fn windows_codex_msix_package_present(data_local_dir: &Path) -> bool {
+    !windows_codex_msix_package_roots(data_local_dir).is_empty()
+}
+
+fn windows_codex_msix_package_roots(data_local_dir: &Path) -> Vec<PathBuf> {
+    let packages = data_local_dir.join("Packages");
+    let Ok(entries) = fs::read_dir(packages) else {
+        return Vec::new();
+    };
+    entries
+        .flatten()
+        .filter_map(|entry| {
+            let file_name = entry.file_name();
+            let file_name = file_name.to_str()?;
+            let file_name = file_name.to_ascii_lowercase();
+            let supported = [
+                "openai.codex_",
+                "openai.chatgpt_",
+                "openai.chatgpt-desktop_",
+            ]
+            .iter()
+            .any(|prefix| file_name.starts_with(prefix));
+            (supported && entry.path().is_dir()).then(|| entry.path())
+        })
+        .collect()
 }
 
 fn executable_names(program: CliProgram, host: HostPlatform) -> Vec<&'static str> {
@@ -300,6 +425,33 @@ mod tests {
     }
 
     #[test]
+    fn windows_rejects_an_explicit_codex_binary_inside_windowsapps() {
+        let temp = tempfile::tempdir().unwrap();
+        let protected = temp
+            .path()
+            .join("Program Files")
+            .join("WindowsApps")
+            .join("OpenAI.Codex_1.0.0.0_x64__publisher")
+            .join("app")
+            .join("resources")
+            .join("codex.exe");
+        executable(&protected);
+
+        let error = resolve_with(
+            CliProgram::Codex,
+            Some(&protected),
+            None,
+            temp.path(),
+            &temp.path().join("data"),
+            &temp.path().join("local-data"),
+            HostPlatform::Windows,
+        )
+        .unwrap_err();
+
+        assert!(error.contains("protected WindowsApps package"));
+    }
+
+    #[test]
     fn windows_candidates_use_native_path_components_and_wrappers() {
         let home = Path::new(r"C:\Users\Example User\用户");
         let data = Path::new(r"C:\Users\Example User\用户\AppData\Roaming");
@@ -322,6 +474,139 @@ mod tests {
                     .join("claude.exe")
             )
         );
+    }
+
+    #[test]
+    fn windows_candidates_include_the_desktop_apps_relocated_cli() {
+        let temp = tempfile::tempdir().unwrap();
+        let local = temp.path().join("AppData").join("Local");
+        let relocated = local
+            .join("OpenAI")
+            .join("Codex")
+            .join("bin")
+            .join("current-version-hash")
+            .join("codex.exe");
+        executable(&relocated);
+
+        let candidates = candidate_paths(
+            CliProgram::Codex,
+            temp.path(),
+            &temp.path().join("data"),
+            &local,
+            HostPlatform::Windows,
+        );
+
+        assert!(candidates.contains(&relocated));
+    }
+
+    #[test]
+    fn windows_candidates_include_the_msix_local_cache_cli() {
+        let temp = tempfile::tempdir().unwrap();
+        let local = temp.path().join("AppData").join("Local");
+        let relocated = local
+            .join("Packages")
+            .join("OpenAI.Codex_2p2nqsd0c76g0")
+            .join("LocalCache")
+            .join("Local")
+            .join("OpenAI")
+            .join("Codex")
+            .join("bin")
+            .join("current-version-hash")
+            .join("codex.exe");
+        executable(&relocated);
+
+        let resolved = resolve_with(
+            CliProgram::Codex,
+            None,
+            None,
+            temp.path(),
+            &temp.path().join("data"),
+            &local,
+            HostPlatform::Windows,
+        )
+        .unwrap();
+
+        assert_eq!(resolved, relocated);
+    }
+
+    #[test]
+    fn windows_prefers_the_relocated_desktop_cli_over_a_path_alias() {
+        let temp = tempfile::tempdir().unwrap();
+        let local = temp.path().join("AppData").join("Local");
+        let relocated = local
+            .join("OpenAI")
+            .join("Codex")
+            .join("bin")
+            .join("current-version-hash")
+            .join("codex.exe");
+        executable(&relocated);
+        let path_directory = temp.path().join("path");
+        let path_alias = path_directory.join("codex");
+        executable(&path_alias);
+
+        let resolved = resolve_with(
+            CliProgram::Codex,
+            None,
+            Some(path_directory.as_os_str()),
+            temp.path(),
+            &temp.path().join("data"),
+            &local,
+            HostPlatform::Windows,
+        )
+        .unwrap();
+
+        assert_eq!(resolved, relocated);
+    }
+
+    #[test]
+    fn windows_msix_without_cli_cache_has_an_actionable_error() {
+        let temp = tempfile::tempdir().unwrap();
+        let local = temp.path().join("AppData").join("Local");
+        fs::create_dir_all(local.join("Packages").join("OpenAI.Codex_2p2nqsd0c76g0")).unwrap();
+
+        let error = resolve_with(
+            CliProgram::Codex,
+            None,
+            None,
+            temp.path(),
+            &temp.path().join("data"),
+            &local,
+            HostPlatform::Windows,
+        )
+        .unwrap_err();
+
+        assert!(error.contains("OpenAI desktop app is installed from Microsoft Store"));
+        assert!(error.contains("open ChatGPT/Codex once"));
+    }
+
+    #[test]
+    fn windows_recognizes_the_chatgpt_desktop_msix_package_name() {
+        let temp = tempfile::tempdir().unwrap();
+        let local = temp.path().join("AppData").join("Local");
+        let relocated = local
+            .join("Packages")
+            .join("OpenAI.ChatGPT-Desktop_2p2nqsd0c76g0")
+            .join("LocalCache")
+            .join("Local")
+            .join("OpenAI")
+            .join("ChatGPT")
+            .join("bin")
+            .join("desktop-version-hash")
+            .join("codex.exe");
+        executable(&relocated);
+
+        let resolved = resolve_with(
+            CliProgram::Codex,
+            None,
+            None,
+            temp.path(),
+            &temp.path().join("data"),
+            &local,
+            HostPlatform::Windows,
+        )
+        .unwrap();
+
+        assert_eq!(resolved, relocated);
     }
 
     #[test]

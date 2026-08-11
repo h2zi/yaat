@@ -7,6 +7,7 @@ fn main() {
     // and the permissions granted by `capabilities/default.json`.
     const COMMANDS: &[&str] = &[
         "bootstrap",
+        "cli_status_refresh",
         "app_update_check",
         "app_update_install",
         "app_update_cancel",

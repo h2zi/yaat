@@ -36,6 +36,7 @@ pub struct CommandSpec {
 impl CommandSpec {
     pub fn into_command(self) -> std::process::Command {
         let mut command = std::process::Command::new(self.program);
+        crate::process::configure_background(&mut command);
         command.args(self.args);
         command.envs(self.env);
         for name in self.env_remove {

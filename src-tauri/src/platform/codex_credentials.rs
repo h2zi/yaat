@@ -1036,6 +1036,7 @@ fn run_codex(
     config_root: &Path,
 ) -> Result<(ExitStatus, Vec<u8>, Vec<u8>), String> {
     let mut command = Command::new(program);
+    crate::process::configure_background(&mut command);
     command
         .args(args)
         .env("CODEX_HOME", config_root)
