@@ -46,8 +46,7 @@ impl CommandSpec {
 
 #[derive(Clone, Debug)]
 pub struct AdapterContext {
-    pub app_data_dir: PathBuf,
-    pub helper_executable: PathBuf,
+    pub data_root: PathBuf,
     pub explicit_cli_path: Option<PathBuf>,
     pub explicit_config_root: Option<PathBuf>,
 }
@@ -55,7 +54,7 @@ pub struct AdapterContext {
 #[derive(Clone, Debug)]
 pub struct ProfileRuntime<'a> {
     pub profile: &'a ProviderProfile,
-    pub secret_ref: Option<&'a str>,
+    pub secret: Option<&'a str>,
 }
 
 #[derive(Clone, Default, Zeroize, ZeroizeOnDrop)]
@@ -105,6 +104,12 @@ pub struct GlobalConfigPlan {
     pub path: PathBuf,
     pub format: ConfigFormat,
     pub operations: Vec<PatchOperation>,
+    pub sidecars: Vec<SidecarPlan>,
+}
+
+pub struct SidecarPlan {
+    pub path: PathBuf,
+    pub contents: Option<Vec<u8>>,
 }
 
 pub trait PlatformAdapter: Send + Sync {

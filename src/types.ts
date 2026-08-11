@@ -5,6 +5,45 @@ export type ProviderKind =
 export type ActivationMode = "managed_launch" | "global_credential";
 export type SecretKind = "none" | "api_key" | "bearer_token";
 export type ProfileStatus = "ready" | "needs_login";
+export type ReasoningEffort =
+  "none" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max" | "ultra";
+
+export interface HeaderEntry {
+  name: string;
+  value: string;
+}
+
+export interface CodexCatalogModel {
+  id: string;
+  displayName: string;
+  description: string;
+  contextWindow: number;
+  supportedReasoningEfforts: ReasoningEffort[];
+  defaultReasoningEffort: ReasoningEffort;
+  supportsImageInput: boolean;
+  supportsImageOriginal: boolean;
+  supportsParallelToolCalls: boolean;
+  supportsReasoningSummaries: boolean;
+  supportsSearchTool: boolean;
+  supportsVerbosity: boolean;
+}
+
+export type ProviderPlatformConfig =
+  | {
+      platform: "codex";
+      defaultModel: string | null;
+      catalog: CodexCatalogModel[];
+    }
+  | {
+      platform: "claude_code";
+      defaultModel: string | null;
+      sonnet: string | null;
+      opus: string | null;
+      haiku: string | null;
+      fable: string | null;
+      subagent: string | null;
+    }
+  | { platform: "claude_desktop"; models: string[] };
 
 export interface ProviderProfile {
   id: string;
@@ -14,6 +53,9 @@ export interface ProviderProfile {
   accountLabel: string | null;
   baseUrl: string | null;
   model: string | null;
+  customHeaders: HeaderEntry[];
+  userAgent: string | null;
+  platformConfig: ProviderPlatformConfig;
   secretKind: SecretKind;
   hasSecret: boolean;
   profileHome: string | null;
@@ -51,9 +93,26 @@ export interface AppSettings {
   unifyClaudeCodeHistory: boolean;
   unifyClaudeDesktopCodeHistory: boolean;
   claudeDesktopHistoryTarget: string | null;
+  usageRefreshIntervalSeconds: 0 | 5 | 10 | 30 | 60;
 }
 
 export type HistoryScope = "codex" | "claude_code" | "claude_desktop_code";
+export type HistorySyncState =
+  | "idle"
+  | "queued"
+  | "scanning"
+  | "normalizing"
+  | "completed"
+  | "failed"
+  | "cancelled";
+
+export interface HistorySyncStatus {
+  scope: HistoryScope;
+  state: HistorySyncState;
+  processedFiles: number;
+  lastCompletedAt: number | null;
+  errorSummary: string | null;
+}
 
 export interface HistoryGroup {
   id: string;
@@ -111,6 +170,7 @@ export interface BootstrapResponse {
   profiles: ProviderProfile[];
   platforms: PlatformState[];
   settings: AppSettings;
+  historySync: HistorySyncStatus[];
 }
 
 export interface ReleaseUpdate {
@@ -133,6 +193,9 @@ export interface CreateProviderRequest {
   accountLabel: string | null;
   baseUrl: string | null;
   model: string | null;
+  customHeaders: HeaderEntry[];
+  userAgent: string | null;
+  platformConfig: ProviderPlatformConfig;
   secretKind: SecretKind;
   secret: string | null;
   officialCredential: string | null;
@@ -144,6 +207,9 @@ export interface UpdateProviderRequest {
   accountLabel: string | null;
   baseUrl: string | null;
   model: string | null;
+  customHeaders: HeaderEntry[];
+  userAgent: string | null;
+  platformConfig: ProviderPlatformConfig;
   secretKind: SecretKind;
   replacementSecret: string | null;
   replacementOfficialCredential: string | null;
@@ -170,6 +236,7 @@ export interface UsageQueryRequest {
   startDate: string;
   endDate: string;
   timezone: string;
+  model: string | null;
 }
 
 export interface TokenBreakdown {
@@ -201,10 +268,54 @@ export interface UsageReport {
   startDate: string;
   endDate: string;
   timezone: string;
+  selectedModel: string | null;
+  availableModels: string[];
   totals: TokenBreakdown;
+  cacheHitTokens: number;
+  cacheHitRate: number;
   requestCount: number;
   buckets: UsageBucket[];
   diagnostics: UsageDiagnostics;
+}
+
+export interface ModelFetchRequest {
+  platform: Platform;
+  baseUrl: string;
+  secretKind: SecretKind;
+  credential: string;
+  customHeaders: HeaderEntry[];
+  userAgent: string | null;
+}
+
+export interface FetchedModel {
+  id: string;
+  ownedBy: string | null;
+  directCompatible: boolean;
+  warning: string | null;
+}
+
+export interface ModelFetchResponse {
+  models: FetchedModel[];
+}
+
+export function emptyPlatformConfig(
+  platform: Platform,
+): ProviderPlatformConfig {
+  if (platform === "codex") {
+    return { platform, defaultModel: null, catalog: [] };
+  }
+  if (platform === "claude_code") {
+    return {
+      platform,
+      defaultModel: null,
+      sonnet: null,
+      opus: null,
+      haiku: null,
+      fable: null,
+      subagent: null,
+    };
+  }
+  return { platform, models: [] };
 }
 
 export const tokenInput = (tokens: TokenBreakdown) =>

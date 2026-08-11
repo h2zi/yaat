@@ -4,13 +4,15 @@
 //! discovered symlinks. Divergent histories are reported as conflicts and are
 //! never overwritten.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs;
 use std::io::{Cursor, Read};
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::UNIX_EPOCH;
 
 use directories::BaseDirs;
+use rusqlite::{Connection, OpenFlags};
 use serde_json::Value;
 use uuid::Uuid;
 use walkdir::WalkDir;
@@ -20,9 +22,10 @@ use yaat_contracts::{
 };
 
 use crate::activation::{FileFingerprint, replace_atomically};
+use crate::db::{HistorySourceState, Repository};
 use crate::error::{AppError, AppResult};
 
-pub const CODEX_HISTORY_PROVIDER_ID: &str = "yaat_managed_v1";
+pub const CODEX_HISTORY_PROVIDER_ID: &str = "custom";
 
 const MAX_HISTORY_FILE_BYTES: u64 = 512 * 1024 * 1024;
 const CLAUDE_SESSIONS_DIR: &str = "claude-code-sessions";
@@ -103,7 +106,7 @@ pub(crate) fn preview_cancellable(
             claude_desktop_groups_cancellable(supplied_roots, cancelled)?
         }
     };
-    let state = scan_cancellable(scope, roots, cancelled, &mut progress)?;
+    let state = scan_cancellable(scope, roots, None, cancelled, &mut progress)?;
     let groups = groups_from_scan(&state);
 
     if scope == HistoryScope::ClaudeDesktopCode && target_group_id.is_none() {
@@ -136,6 +139,7 @@ pub(crate) fn preview_cancellable(
     })
 }
 
+#[cfg(test)]
 pub(crate) fn apply(
     scope: HistoryScope,
     supplied_roots: Vec<HistoryRoot>,
@@ -150,7 +154,66 @@ pub(crate) fn apply(
     )
 }
 
+#[cfg(test)]
 pub(crate) fn apply_cancellable(
+    scope: HistoryScope,
+    supplied_roots: Vec<HistoryRoot>,
+    target_group_id: Option<&str>,
+    cancelled: &AtomicBool,
+    progress: impl FnMut(OperationProgress),
+) -> AppResult<HistoryApplyResult> {
+    apply_with_repository(
+        None,
+        false,
+        scope,
+        supplied_roots,
+        target_group_id,
+        cancelled,
+        progress,
+    )
+}
+
+pub(crate) fn apply_incremental_cancellable(
+    repository: &Repository,
+    scope: HistoryScope,
+    supplied_roots: Vec<HistoryRoot>,
+    target_group_id: Option<&str>,
+    cancelled: &AtomicBool,
+    progress: impl FnMut(OperationProgress),
+) -> AppResult<HistoryApplyResult> {
+    apply_with_repository(
+        Some(repository),
+        true,
+        scope,
+        supplied_roots,
+        target_group_id,
+        cancelled,
+        progress,
+    )
+}
+
+pub(crate) fn apply_full_indexed_cancellable(
+    repository: &Repository,
+    scope: HistoryScope,
+    supplied_roots: Vec<HistoryRoot>,
+    target_group_id: Option<&str>,
+    cancelled: &AtomicBool,
+    progress: impl FnMut(OperationProgress),
+) -> AppResult<HistoryApplyResult> {
+    apply_with_repository(
+        Some(repository),
+        false,
+        scope,
+        supplied_roots,
+        target_group_id,
+        cancelled,
+        progress,
+    )
+}
+
+fn apply_with_repository(
+    repository: Option<&Repository>,
+    use_cache: bool,
     scope: HistoryScope,
     supplied_roots: Vec<HistoryRoot>,
     target_group_id: Option<&str>,
@@ -168,7 +231,11 @@ pub(crate) fn apply_cancellable(
             claude_desktop_groups_cancellable(supplied_roots, cancelled)?
         }
     };
-    let mut state = scan_cancellable(scope, roots, cancelled, &mut progress)?;
+    let cache = repository
+        .filter(|_| use_cache)
+        .map(|repository| load_history_cache(repository, scope))
+        .transpose()?;
+    let mut state = scan_cancellable(scope, roots, cache.as_ref(), cancelled, &mut progress)?;
     let target_index = resolve_target(&state, target_group_id)?;
 
     let mut metadata_updated = 0u64;
@@ -190,9 +257,11 @@ pub(crate) fn apply_cancellable(
                 .map_err(|error| AppError::ConfigConflict(error.to_string()))?;
             metadata_updated = metadata_updated.saturating_add(1);
         }
+        metadata_updated = metadata_updated
+            .saturating_add(normalize_codex_state_databases(&state.roots, cancelled)?);
         // Re-scan after the provider-only rewrites so copies use the exact bytes
         // that are now present on disk.
-        state = scan_cancellable(scope, state.roots, cancelled, &mut progress)?;
+        state = scan_cancellable(scope, state.roots, cache.as_ref(), cancelled, &mut progress)?;
     }
 
     check_cancelled(cancelled)?;
@@ -228,6 +297,9 @@ pub(crate) fn apply_cancellable(
         });
     }
 
+    if let Some(repository) = repository {
+        save_history_cache(repository, &state)?;
+    }
     Ok(HistoryApplyResult {
         scope,
         copied,
@@ -238,14 +310,55 @@ pub(crate) fn apply_cancellable(
     })
 }
 
+fn normalize_codex_state_databases(
+    roots: &[HistoryRoot],
+    cancelled: &AtomicBool,
+) -> AppResult<u64> {
+    let mut updated = 0_u64;
+    for root in roots {
+        check_cancelled(cancelled)?;
+        let path = root.path.join("state_5.sqlite");
+        if !path.exists() {
+            continue;
+        }
+        let connection = Connection::open_with_flags(
+            &path,
+            OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )
+        .map_err(|error| {
+            AppError::ConfigConflict(format!(
+                "unable to open Codex state database {}: {error}",
+                path.display()
+            ))
+        })?;
+        connection
+            .busy_timeout(std::time::Duration::from_secs(5))
+            .map_err(|error| AppError::ConfigConflict(error.to_string()))?;
+        let changed = connection
+            .execute(
+                "UPDATE threads SET model_provider = ?1 WHERE model_provider <> ?1 OR model_provider IS NULL",
+                [CODEX_HISTORY_PROVIDER_ID],
+            )
+            .map_err(|error| {
+                AppError::ConfigConflict(format!(
+                    "unable to normalize Codex state database {}: {error}",
+                    path.display()
+                ))
+            })?;
+        updated = updated.saturating_add(changed as u64);
+    }
+    Ok(updated)
+}
+
 #[cfg(test)]
 fn scan(scope: HistoryScope, roots: Vec<HistoryRoot>) -> AppResult<ScanState> {
-    scan_cancellable(scope, roots, &AtomicBool::new(false), &mut |_| {})
+    scan_cancellable(scope, roots, None, &AtomicBool::new(false), &mut |_| {})
 }
 
 fn scan_cancellable(
     scope: HistoryScope,
     roots: Vec<HistoryRoot>,
+    cache: Option<&HashMap<(String, String), HistorySourceState>>,
     cancelled: &AtomicBool,
     progress: &mut impl FnMut(OperationProgress),
 ) -> AppResult<ScanState> {
@@ -282,7 +395,17 @@ fn scan_cancellable(
                                 AppError::Internal("history path escaped its root".into())
                             })?
                             .to_path_buf();
-                        let snapshot = codex_snapshot(root_index, entry.path(), relative)?;
+                        let snapshot = match cached_snapshot(
+                            cache,
+                            scope,
+                            root_index,
+                            root,
+                            entry.path(),
+                            &relative,
+                        )? {
+                            Some(snapshot) => snapshot,
+                            None => codex_snapshot(root_index, entry.path(), relative)?,
+                        };
                         if snapshot.normalized_fingerprint.is_none() {
                             invalid_files = invalid_files.saturating_add(1);
                         }
@@ -314,7 +437,18 @@ fn scan_cancellable(
                         .strip_prefix(&root.path)
                         .map_err(|_| AppError::Internal("history path escaped its root".into()))?
                         .to_path_buf();
-                    files.push(claude_code_snapshot(root_index, entry.path(), relative)?);
+                    let snapshot = match cached_snapshot(
+                        cache,
+                        scope,
+                        root_index,
+                        root,
+                        entry.path(),
+                        &relative,
+                    )? {
+                        Some(snapshot) => snapshot,
+                        None => claude_code_snapshot(root_index, entry.path(), relative)?,
+                    };
+                    files.push(snapshot);
                     progress(OperationProgress {
                         phase: OperationPhase::Processing,
                         processed: files.len() as u64,
@@ -345,7 +479,18 @@ fn scan_cancellable(
                     {
                         continue;
                     }
-                    let snapshot = claude_snapshot(root_index, &entry.path(), PathBuf::from(name))?;
+                    let relative = PathBuf::from(name);
+                    let snapshot = match cached_snapshot(
+                        cache,
+                        scope,
+                        root_index,
+                        root,
+                        &entry.path(),
+                        &relative,
+                    )? {
+                        Some(snapshot) => snapshot,
+                        None => claude_snapshot(root_index, &entry.path(), relative)?,
+                    };
                     if snapshot.normalized_fingerprint.is_none() {
                         invalid_files = invalid_files.saturating_add(1);
                     }
@@ -375,6 +520,85 @@ fn scan_cancellable(
         files,
         invalid_files,
     })
+}
+
+fn load_history_cache(
+    repository: &Repository,
+    scope: HistoryScope,
+) -> AppResult<HashMap<(String, String), HistorySourceState>> {
+    Ok(repository
+        .history_source_states(scope)
+        .map_err(AppError::database)?
+        .into_iter()
+        .map(|state| ((state.root_id.clone(), state.source_path.clone()), state))
+        .collect())
+}
+
+fn cached_snapshot(
+    cache: Option<&HashMap<(String, String), HistorySourceState>>,
+    _scope: HistoryScope,
+    root_index: usize,
+    root: &HistoryRoot,
+    path: &Path,
+    relative_path: &Path,
+) -> AppResult<Option<FileSnapshot>> {
+    let Some(cache) = cache else {
+        return Ok(None);
+    };
+    let source_path = path.to_string_lossy().into_owned();
+    let Some(cached) = cache.get(&(root.id.clone(), source_path)) else {
+        return Ok(None);
+    };
+    let metadata = fs::metadata(path).map_err(AppError::io)?;
+    let modified_at = modified_millis(&metadata)?;
+    if metadata.len() != cached.file_size || modified_at != cached.modified_at {
+        return Ok(None);
+    }
+    let Some(fingerprint) = FileFingerprint::from_hex(&cached.fingerprint) else {
+        return Ok(None);
+    };
+    Ok(Some(FileSnapshot {
+        root_index,
+        path: path.to_path_buf(),
+        relative_path: relative_path.to_path_buf(),
+        key: cached.session_key.clone(),
+        normalized_fingerprint: Some(fingerprint),
+        needs_metadata_update: false,
+    }))
+}
+
+fn save_history_cache(repository: &Repository, state: &ScanState) -> AppResult<()> {
+    let sources = state
+        .files
+        .iter()
+        .filter_map(|file| {
+            let fingerprint = file.normalized_fingerprint?;
+            let metadata = fs::metadata(&file.path).ok()?;
+            let modified_at = modified_millis(&metadata).ok()?;
+            Some(HistorySourceState {
+                root_id: state.roots[file.root_index].id.clone(),
+                source_path: file.path.to_string_lossy().into_owned(),
+                session_key: file.key.clone(),
+                file_size: metadata.len(),
+                modified_at,
+                fingerprint: fingerprint.to_hex(),
+            })
+        })
+        .collect::<Vec<_>>();
+    repository
+        .replace_history_sources(state.scope, &sources)
+        .map_err(AppError::database)
+}
+
+fn modified_millis(metadata: &fs::Metadata) -> AppResult<i64> {
+    let millis = metadata
+        .modified()
+        .map_err(AppError::io)?
+        .duration_since(UNIX_EPOCH)
+        .map_err(|_| AppError::Validation("history timestamp predates the epoch".into()))?
+        .as_millis();
+    i64::try_from(millis)
+        .map_err(|_| AppError::Validation("history timestamp is out of range".into()))
 }
 
 fn claude_code_snapshot(
@@ -416,7 +640,10 @@ fn codex_snapshot(
     let needs_metadata_update = normalized
         .as_deref()
         .is_some_and(|normalized| decoded.as_deref() != Some(normalized));
-    let key = canonical_codex_key(path)?;
+    let key = decoded
+        .as_deref()
+        .and_then(codex_session_id)
+        .unwrap_or(canonical_codex_key(path)?);
     Ok(FileSnapshot {
         root_index,
         path: path.to_path_buf(),
@@ -551,6 +778,28 @@ fn normalize_codex_jsonl(bytes: &[u8]) -> Result<Vec<u8>, ()> {
     }
 
     saw_session_meta.then_some(output).ok_or(())
+}
+
+fn codex_session_id(bytes: &[u8]) -> Option<String> {
+    let text = std::str::from_utf8(bytes).ok()?;
+    for line in text.lines() {
+        if !line.contains("\"session_meta\"") {
+            continue;
+        }
+        let value: Value = serde_json::from_str(line).ok()?;
+        if value.get("type").and_then(Value::as_str) != Some("session_meta") {
+            continue;
+        }
+        let id = value
+            .get("payload")
+            .and_then(|payload| payload.get("id"))
+            .and_then(Value::as_str)?
+            .trim();
+        if !id.is_empty() && id.len() <= 128 && !id.chars().any(char::is_control) {
+            return Some(id.to_owned());
+        }
+    }
+    None
 }
 
 fn plan_copies(state: &ScanState, target_index: Option<usize>) -> AppResult<CopyPlan> {
@@ -1217,6 +1466,35 @@ mod tests {
 
         let result = apply(HistoryScope::Codex, roots, None).unwrap();
         assert_eq!(result.copied, 1);
+        assert_eq!(fs::read(second_path).unwrap(), extended);
+    }
+
+    #[test]
+    fn codex_session_id_is_stable_across_different_rollout_paths() {
+        let temp = tempfile::tempdir().unwrap();
+        let first = temp.path().join("first");
+        let second = temp.path().join("second");
+        let first_path = first.join("sessions/2026/08/03/rollout-new-name.jsonl");
+        let second_path = second.join("archived_sessions/rollout-old-name.jsonl");
+        fs::create_dir_all(first_path.parent().unwrap()).unwrap();
+        fs::create_dir_all(second_path.parent().unwrap()).unwrap();
+        let old = codex_line(CODEX_HISTORY_PROVIDER_ID);
+        let mut extended = old.clone();
+        extended.extend_from_slice(
+            b"{\"type\":\"event_msg\",\"payload\":{\"type\":\"user_message\",\"message\":\"continued\"}}\n",
+        );
+        fs::write(&first_path, &extended).unwrap();
+        fs::write(&second_path, &old).unwrap();
+
+        let result = apply(
+            HistoryScope::Codex,
+            vec![root("first", &first), root("second", &second)],
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(result.copied, 1);
+        assert_eq!(result.conflicts, 0);
         assert_eq!(fs::read(second_path).unwrap(), extended);
     }
 

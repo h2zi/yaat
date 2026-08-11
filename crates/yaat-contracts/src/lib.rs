@@ -59,6 +59,102 @@ pub enum SecretKind {
     BearerToken,
 }
 
+/// One validated custom HTTP header attached to provider requests.
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HeaderEntry {
+    pub name: String,
+    pub value: String,
+}
+
+/// Reasoning efforts understood by the current Codex model-catalog schema.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReasoningEffort {
+    None,
+    Minimal,
+    #[default]
+    Low,
+    Medium,
+    High,
+    Xhigh,
+    Max,
+    Ultra,
+}
+
+/// One YAAT-authored entry in a Codex model catalog.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CodexCatalogModel {
+    pub id: String,
+    pub display_name: String,
+    pub description: String,
+    pub context_window: u64,
+    pub supported_reasoning_efforts: Vec<ReasoningEffort>,
+    pub default_reasoning_effort: ReasoningEffort,
+    pub supports_image_input: bool,
+    pub supports_image_original: bool,
+    pub supports_parallel_tool_calls: bool,
+    pub supports_reasoning_summaries: bool,
+    pub supports_search_tool: bool,
+    pub supports_verbosity: bool,
+}
+
+/// Platform-specific provider settings persisted as a validated tagged value.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(
+    tag = "platform",
+    rename_all = "snake_case",
+    rename_all_fields = "camelCase"
+)]
+pub enum ProviderPlatformConfig {
+    Codex {
+        default_model: Option<String>,
+        catalog: Vec<CodexCatalogModel>,
+    },
+    ClaudeCode {
+        default_model: Option<String>,
+        sonnet: Option<String>,
+        opus: Option<String>,
+        haiku: Option<String>,
+        fable: Option<String>,
+        subagent: Option<String>,
+    },
+    ClaudeDesktop {
+        models: Vec<String>,
+    },
+}
+
+impl Default for ProviderPlatformConfig {
+    fn default() -> Self {
+        Self::Codex {
+            default_model: None,
+            catalog: Vec::new(),
+        }
+    }
+}
+
+impl ProviderPlatformConfig {
+    #[must_use]
+    pub const fn empty_for(platform: Platform) -> Self {
+        match platform {
+            Platform::Codex => Self::Codex {
+                default_model: None,
+                catalog: Vec::new(),
+            },
+            Platform::ClaudeCode => Self::ClaudeCode {
+                default_model: None,
+                sonnet: None,
+                opus: None,
+                haiku: None,
+                fable: None,
+                subagent: None,
+            },
+            Platform::ClaudeDesktop => Self::ClaudeDesktop { models: Vec::new() },
+        }
+    }
+}
+
 /// Readiness of a profile for launching or activation.
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -79,6 +175,9 @@ pub struct ProviderProfile {
     pub account_label: Option<String>,
     pub base_url: Option<String>,
     pub model: Option<String>,
+    pub custom_headers: Vec<HeaderEntry>,
+    pub user_agent: Option<String>,
+    pub platform_config: ProviderPlatformConfig,
     pub secret_kind: SecretKind,
     pub has_secret: bool,
     pub profile_home: Option<String>,
@@ -97,6 +196,9 @@ pub struct CreateProviderRequest {
     pub account_label: Option<String>,
     pub base_url: Option<String>,
     pub model: Option<String>,
+    pub custom_headers: Vec<HeaderEntry>,
+    pub user_agent: Option<String>,
+    pub platform_config: ProviderPlatformConfig,
     pub secret_kind: SecretKind,
     pub secret: Option<String>,
     pub official_credential: Option<String>,
@@ -111,6 +213,9 @@ pub struct UpdateProviderRequest {
     pub account_label: Option<String>,
     pub base_url: Option<String>,
     pub model: Option<String>,
+    pub custom_headers: Vec<HeaderEntry>,
+    pub user_agent: Option<String>,
+    pub platform_config: ProviderPlatformConfig,
     pub secret_kind: SecretKind,
     pub replacement_secret: Option<String>,
     pub replacement_official_credential: Option<String>,
@@ -184,16 +289,69 @@ pub struct AppSettings {
     pub unify_claude_code_history: bool,
     pub unify_claude_desktop_code_history: bool,
     pub claude_desktop_history_target: Option<String>,
+    pub usage_refresh_interval_seconds: u64,
+}
+
+/// Draft provider data used to discover models without persisting credentials.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelFetchRequest {
+    pub platform: Platform,
+    pub base_url: String,
+    pub secret_kind: SecretKind,
+    pub credential: String,
+    pub custom_headers: Vec<HeaderEntry>,
+    pub user_agent: Option<String>,
+}
+
+/// One model returned by a provider's discovery endpoint.
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FetchedModel {
+    pub id: String,
+    pub owned_by: Option<String>,
+    pub direct_compatible: bool,
+    pub warning: Option<String>,
+}
+
+/// Sanitized result of provider model discovery.
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelFetchResponse {
+    pub models: Vec<FetchedModel>,
 }
 
 /// Local session-history domain to scan or reconcile.
-#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, Hash, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum HistoryScope {
     #[default]
     Codex,
     ClaudeCode,
     ClaudeDesktopCode,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HistorySyncState {
+    #[default]
+    Idle,
+    Queued,
+    Scanning,
+    Normalizing,
+    Completed,
+    Failed,
+    Cancelled,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HistorySyncStatus {
+    pub scope: HistoryScope,
+    pub state: HistorySyncState,
+    pub processed_files: u64,
+    pub last_completed_at: Option<i64>,
+    pub error_summary: Option<String>,
 }
 
 /// One discovered source or target group for history reconciliation.
@@ -276,6 +434,7 @@ pub struct BootstrapResponse {
     pub profiles: Vec<ProviderProfile>,
     pub platforms: Vec<PlatformState>,
     pub settings: AppSettings,
+    pub history_sync: Vec<HistorySyncStatus>,
 }
 
 /// Newer published YAAT version reported by the release service.
@@ -312,6 +471,7 @@ pub struct UsageQueryRequest {
     pub start_date: String,
     pub end_date: String,
     pub timezone: String,
+    pub model: Option<String>,
 }
 
 /// Request to rebuild one platform's local usage snapshot.
@@ -371,14 +531,18 @@ pub struct UsageDiagnostics {
 }
 
 /// Aggregated local usage for a requested date range.
-#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct UsageReport {
     pub platform: Platform,
     pub start_date: String,
     pub end_date: String,
     pub timezone: String,
+    pub selected_model: Option<String>,
+    pub available_models: Vec<String>,
     pub totals: TokenBreakdown,
+    pub cache_hit_tokens: u64,
+    pub cache_hit_rate: f64,
     pub request_count: u64,
     pub buckets: Vec<UsageBucket>,
     pub diagnostics: UsageDiagnostics,

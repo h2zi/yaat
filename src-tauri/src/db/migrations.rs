@@ -24,6 +24,9 @@ const MIGRATIONS: &[Migration] = &[Migration {
             account_label   TEXT,
             base_url        TEXT,
             model           TEXT,
+            custom_headers  TEXT NOT NULL DEFAULT '[]',
+            user_agent      TEXT,
+            platform_config TEXT NOT NULL,
             secret_kind     TEXT NOT NULL CHECK (secret_kind IN ('none', 'api_key', 'bearer_token')),
             profile_home    TEXT,
             status          TEXT NOT NULL CHECK (status IN ('ready', 'needs_login')),
@@ -64,6 +67,8 @@ const MIGRATIONS: &[Migration] = &[Migration {
             unify_claude_code_history INTEGER NOT NULL DEFAULT 0 CHECK (unify_claude_code_history IN (0, 1)),
             unify_claude_desktop_code_history INTEGER NOT NULL DEFAULT 0 CHECK (unify_claude_desktop_code_history IN (0, 1)),
             claude_desktop_history_target TEXT,
+            usage_refresh_interval_seconds INTEGER NOT NULL DEFAULT 0
+                CHECK (usage_refresh_interval_seconds IN (0, 5, 10, 30, 60)),
             updated_at              INTEGER NOT NULL
         );
 
@@ -80,9 +85,10 @@ const MIGRATIONS: &[Migration] = &[Migration {
 
         CREATE INDEX account_data_provider_idx ON account_data(provider_id);
 
-        CREATE TABLE usage (
+        CREATE TABLE usage_events (
             platform                 TEXT NOT NULL CHECK (platform IN ('codex', 'claude_code', 'claude_desktop')),
             event_id                 TEXT NOT NULL,
+            model                    TEXT,
             occurred_at              INTEGER NOT NULL,
             uncached_input           INTEGER NOT NULL CHECK (uncached_input >= 0),
             cache_read               INTEGER NOT NULL CHECK (cache_read >= 0),
@@ -94,8 +100,34 @@ const MIGRATIONS: &[Migration] = &[Migration {
             PRIMARY KEY(platform, event_id)
         );
 
-        CREATE INDEX usage_platform_time_idx
-            ON usage(platform, occurred_at);
+        CREATE INDEX usage_events_platform_time_idx
+            ON usage_events(platform, occurred_at);
+
+        CREATE INDEX usage_events_platform_model_time_idx
+            ON usage_events(platform, model, occurred_at);
+
+        CREATE TABLE usage_sources (
+            platform                 TEXT NOT NULL CHECK (platform IN ('codex', 'claude_code', 'claude_desktop')),
+            source_path              TEXT NOT NULL,
+            file_size                INTEGER NOT NULL CHECK (file_size >= 0),
+            modified_at              INTEGER NOT NULL,
+            fingerprint              TEXT NOT NULL,
+            malformed_records        INTEGER NOT NULL DEFAULT 0 CHECK (malformed_records >= 0),
+            scanned_at               INTEGER NOT NULL,
+            PRIMARY KEY(platform, source_path)
+        );
+
+        CREATE TABLE usage_event_sources (
+            platform                 TEXT NOT NULL,
+            event_id                 TEXT NOT NULL,
+            source_path              TEXT NOT NULL,
+            PRIMARY KEY(platform, event_id, source_path),
+            FOREIGN KEY(platform, event_id) REFERENCES usage_events(platform, event_id) ON DELETE CASCADE,
+            FOREIGN KEY(platform, source_path) REFERENCES usage_sources(platform, source_path) ON DELETE CASCADE
+        );
+
+        CREATE INDEX usage_event_sources_path_idx
+            ON usage_event_sources(platform, source_path);
 
         CREATE TABLE usage_scan_summary (
             platform                 TEXT NOT NULL CHECK (platform IN ('codex', 'claude_code', 'claude_desktop')),
@@ -107,6 +139,26 @@ const MIGRATIONS: &[Migration] = &[Migration {
             last_scanned_at           INTEGER,
             is_partial               INTEGER NOT NULL DEFAULT 0 CHECK (is_partial IN (0, 1)),
             PRIMARY KEY(platform)
+        );
+
+        CREATE TABLE history_sources (
+            scope                     TEXT NOT NULL CHECK (scope IN ('codex', 'claude_code', 'claude_desktop_code')),
+            root_id                   TEXT NOT NULL,
+            source_path               TEXT NOT NULL,
+            session_key               TEXT NOT NULL,
+            file_size                 INTEGER NOT NULL CHECK (file_size >= 0),
+            modified_at               INTEGER NOT NULL,
+            fingerprint               TEXT NOT NULL,
+            processed_at              INTEGER NOT NULL,
+            PRIMARY KEY(scope, root_id, source_path)
+        );
+
+        CREATE TABLE history_sync_status (
+            scope                     TEXT PRIMARY KEY NOT NULL CHECK (scope IN ('codex', 'claude_code', 'claude_desktop_code')),
+            state                     TEXT NOT NULL,
+            processed_files           INTEGER NOT NULL DEFAULT 0,
+            last_completed_at          INTEGER,
+            error_summary             TEXT
         );
     "#,
 }];

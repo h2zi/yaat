@@ -46,6 +46,19 @@ mod paths {
             .ok_or_else(|| "invalid identifier".into())
     }
 
+    pub fn managed_profile_home_at(
+        data_root: &Path,
+        platform: Platform,
+        profile_id: &str,
+    ) -> Result<PathBuf, String> {
+        validate_identifier(profile_id)?;
+        Ok(data_root
+            .join("profiles")
+            .join(platform.as_str())
+            .join(profile_id)
+            .join("home"))
+    }
+
     pub fn ensure_private_directory(path: &Path) -> Result<(), std::io::Error> {
         std::fs::create_dir_all(path)?;
         #[cfg(unix)]
@@ -137,8 +150,7 @@ mod platform {
 
     #[derive(Clone, Debug)]
     pub struct AdapterContext {
-        pub app_data_dir: PathBuf,
-        pub helper_executable: PathBuf,
+        pub data_root: PathBuf,
         pub explicit_cli_path: Option<PathBuf>,
         pub explicit_config_root: Option<PathBuf>,
     }
@@ -146,7 +158,7 @@ mod platform {
     #[derive(Clone, Debug)]
     pub struct ProfileRuntime<'a> {
         pub profile: &'a ProviderProfile,
-        pub secret_ref: Option<&'a str>,
+        pub secret: Option<&'a str>,
     }
 
     #[derive(Clone, Debug, Default)]
@@ -167,6 +179,12 @@ mod platform {
         pub path: PathBuf,
         pub format: activation::ConfigFormat,
         pub operations: Vec<activation::PatchOperation>,
+        pub sidecars: Vec<SidecarPlan>,
+    }
+
+    pub struct SidecarPlan {
+        pub path: PathBuf,
+        pub contents: Option<Vec<u8>>,
     }
 
     pub trait PlatformAdapter: Send + Sync {
@@ -248,6 +266,7 @@ fn main() {
         source_root.join("settings.json"),
         r#"{
   // user comment must survive
+  "apiKeyHelper": "obsolete YAAT helper",
   "theme": "dark",
   "permissions": { "allow": ["Read"] },
   "mcpServers": { "user": { "command": "do-not-run" } }
@@ -255,13 +274,6 @@ fn main() {
 "#,
     )
     .unwrap();
-    let helper = temp.path().join("yaat-helper");
-    fs::write(&helper, "#!/bin/sh\nprintf '%s\\n' fake-token\n").unwrap();
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(&helper, fs::Permissions::from_mode(0o700)).unwrap();
-    }
     let profile = ProviderProfile {
         id: "docker-profile".into(),
         platform: Platform::ClaudeCode,
@@ -270,6 +282,16 @@ fn main() {
         account_label: None,
         base_url: Some("https://gateway.example.invalid".into()),
         model: Some("claude-sonnet-test".into()),
+        custom_headers: Vec::new(),
+        user_agent: Some("YAAT-Interop/1".into()),
+        platform_config: yaat_contracts::ProviderPlatformConfig::ClaudeCode {
+            default_model: Some("claude-sonnet-test".into()),
+            sonnet: Some("claude-sonnet-test".into()),
+            opus: None,
+            haiku: None,
+            fable: None,
+            subagent: None,
+        },
         secret_kind: SecretKind::ApiKey,
         has_secret: true,
         profile_home: None,
@@ -278,18 +300,17 @@ fn main() {
         updated_at: 0,
     };
     let context = AdapterContext {
-        app_data_dir: temp.path().join("yaat-data"),
-        helper_executable: helper.clone(),
+        data_root: temp.path().join("yaat-data"),
         explicit_cli_path: Some(claude.clone()),
         explicit_config_root: None,
     };
     let adapter = ClaudeAdapter::new();
     let (_, version) = adapter.discover_cli(&context).unwrap();
-    assert_eq!(version, "2.1.220");
+    assert_eq!(version, "2.1.226");
 
     let runtime = ProfileRuntime {
         profile: &profile,
-        secret_ref: Some(&profile.id),
+        secret: Some("fake-token"),
     };
     let plan = adapter
         .global_config_plan(&context, runtime.clone())
@@ -299,8 +320,9 @@ fn main() {
     assert!(global.contains("user comment must survive"));
     assert!(global.contains("\"permissions\""));
     assert!(global.contains("\"mcpServers\""));
-    assert!(global.contains("\"apiKeyHelper\""));
-    assert!(!global.contains("fake-token"));
+    assert!(global.contains("\"ANTHROPIC_API_KEY\": \"fake-token\""));
+    assert!(global.contains("User-Agent: YAAT-Interop/1"));
+    assert!(!global.contains("apiKeyHelper"));
 
     let project = temp.path().join("project");
     fs::create_dir(&project).unwrap();
@@ -311,7 +333,8 @@ fn main() {
     let managed_root = PathBuf::from(spec.env.get("CLAUDE_CONFIG_DIR").unwrap());
     let managed = fs::read_to_string(managed_root.join("settings.json")).unwrap();
     assert!(managed.contains("user comment must survive"));
-    assert!(managed.contains("\"apiKeyHelper\""));
+    assert!(managed.contains("\"ANTHROPIC_API_KEY\": \"fake-token\""));
+    assert!(!managed.contains("apiKeyHelper"));
     assert!(
         spec.env_remove
             .iter()

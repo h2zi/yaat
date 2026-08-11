@@ -7,7 +7,7 @@ RUN corepack install --global pnpm@11.18.0
 
 FROM rust:1.97.1-bookworm
 
-ARG CLAUDE_VERSION=2.1.220
+ARG CLAUDE_VERSION=2.1.226
 
 COPY --from=node /usr/local/ /usr/local/
 RUN rustup component add clippy rustfmt

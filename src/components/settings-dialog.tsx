@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import {
   ChevronDown,
   FolderCog,
@@ -41,12 +41,14 @@ import type {
   HistoryPreview,
   OperationProgress,
   HistoryScope,
+  HistorySyncStatus,
 } from "@/types";
 
 interface SettingsDialogProps {
   open: boolean;
   onOpenChange: (open: boolean) => void;
   settings: AppSettings;
+  historySync: HistorySyncStatus[];
   language: Language;
   busy: boolean;
   onPreviewTheme: (theme: string) => void;
@@ -97,6 +99,7 @@ export function SettingsDialog({
   open,
   onOpenChange,
   settings,
+  historySync,
   language,
   busy,
   onPreviewTheme,
@@ -121,9 +124,12 @@ export function SettingsDialog({
   const [claudeHistoryResult, setClaudeHistoryResult] =
     useState<HistoryApplyResult | null>(null);
   const [claudeTarget, setClaudeTarget] = useState<string>("");
+  const [syncStatuses, setSyncStatuses] =
+    useState<HistorySyncStatus[]>(historySync);
+  const wasOpen = useRef(false);
 
   useEffect(() => {
-    if (open) {
+    if (open && !wasOpen.current) {
       setDraft(settings);
       setAdvanced(false);
       setHistoryBusy(null);
@@ -135,7 +141,28 @@ export function SettingsDialog({
       setClaudeHistory(null);
       setClaudeHistoryResult(null);
       setClaudeTarget(settings.claudeDesktopHistoryTarget ?? "");
+      setSyncStatuses(historySync);
     }
+    wasOpen.current = open;
+  }, [historySync, open, settings]);
+
+  useEffect(() => {
+    if (!open) return;
+    let cancelled = false;
+    const refreshStatus = () => {
+      void api
+        .historySyncStatus()
+        .then((status) => {
+          if (!cancelled) setSyncStatuses(status);
+        })
+        .catch(() => undefined);
+    };
+    refreshStatus();
+    const timer = window.setInterval(refreshStatus, 1_000);
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+    };
   }, [open]);
 
   const save = async () => {
@@ -157,6 +184,11 @@ export function SettingsDialog({
     ) {
       await scanClaudeGroups();
       return;
+    }
+
+    if (scope === "codex" && enabled) {
+      const unified = await applyHistory("codex", null);
+      if (!unified) return;
     }
 
     const previous = draft;
@@ -182,7 +214,7 @@ export function SettingsDialog({
       setDraft(previous);
       return;
     }
-    if (enabled) {
+    if (enabled && scope !== "codex") {
       await applyHistory(
         scope,
         scope === "claude_desktop_code"
@@ -227,7 +259,7 @@ export function SettingsDialog({
   const applyHistory = async (
     scope: HistoryScope,
     targetGroupId: string | null,
-  ) => {
+  ): Promise<boolean> => {
     setHistoryBusy(scope);
     setHistoryProgress({ phase: "discovering", processed: 0, total: null });
     setHistoryCancelling(false);
@@ -240,10 +272,12 @@ export function SettingsDialog({
       if (scope === "codex") setCodexHistory(result);
       else if (scope === "claude_code") setClaudeCodeHistory(result);
       else setClaudeHistoryResult(result);
+      return true;
     } catch (error) {
       if (!(error instanceof ApiRequestError && error.code === "cancelled")) {
         setHistoryError(error instanceof Error ? error.message : String(error));
       }
+      return false;
     } finally {
       setHistoryBusy(null);
       setHistoryCancelling(false);
@@ -313,6 +347,23 @@ export function SettingsDialog({
     </div>
   );
 
+  const statusLabel = (state: HistorySyncStatus["state"]) =>
+    t(
+      state === "idle"
+        ? "historyStateIdle"
+        : state === "queued"
+          ? "historyStateQueued"
+          : state === "scanning"
+            ? "historyStateScanning"
+            : state === "normalizing"
+              ? "historyStateNormalizing"
+              : state === "completed"
+                ? "historyStateCompleted"
+                : state === "cancelled"
+                  ? "historyStateCancelled"
+                  : "historyStateFailed",
+    );
+
   return (
     <Dialog
       open={open}
@@ -321,7 +372,7 @@ export function SettingsDialog({
         onOpenChange(next);
       }}
     >
-      <DialogContent className="max-w-2xl">
+      <DialogContent className="max-h-[90vh] max-w-2xl overflow-y-auto">
         <DialogHeader>
           <DialogTitle>{t("settingsTitle")}</DialogTitle>
         </DialogHeader>
@@ -435,6 +486,44 @@ export function SettingsDialog({
             <p className="text-sm leading-relaxed text-muted-foreground">
               {t("sessionHistoryDescription")}
             </p>
+            <div className="grid gap-2 sm:grid-cols-3">
+              {syncStatuses.map((status) => (
+                <div
+                  className="rounded-lg border border-border bg-muted/25 px-3 py-2 text-xs"
+                  key={status.scope}
+                >
+                  <div className="flex items-center justify-between gap-2">
+                    <span className="font-medium">
+                      {status.scope === "codex"
+                        ? "Codex"
+                        : status.scope === "claude_code"
+                          ? "Claude Code"
+                          : "Claude Desktop"}
+                    </span>
+                    <span className="text-muted-foreground">
+                      {statusLabel(status.state)}
+                    </span>
+                  </div>
+                  {status.processedFiles > 0 ? (
+                    <p className="mt-1 text-muted-foreground">
+                      {status.processedFiles} {t("historyProcessed")}
+                    </p>
+                  ) : null}
+                  {status.lastCompletedAt ? (
+                    <p className="mt-1 truncate text-muted-foreground">
+                      {new Date(status.lastCompletedAt).toLocaleString(
+                        language === "zh" ? "zh-CN" : "en",
+                      )}
+                    </p>
+                  ) : null}
+                  {status.errorSummary ? (
+                    <p className="mt-1 line-clamp-2 text-destructive">
+                      {status.errorSummary}
+                    </p>
+                  ) : null}
+                </div>
+              ))}
+            </div>
             <div className="grid gap-3 rounded-xl border border-border p-4">
               <div className="flex items-start gap-3">
                 <div className="min-w-0 flex-1">
@@ -445,15 +534,37 @@ export function SettingsDialog({
                     {t("codexUnifiedHistoryDescription")}
                   </p>
                 </div>
-                <Switch
-                  className="disabled:opacity-100"
-                  checked={draft.unifyCodexHistory}
-                  disabled={busy || historyBusy === "codex"}
-                  aria-label={t("codexUnifiedHistory")}
-                  onCheckedChange={(checked) =>
-                    void setHistoryEnabled("codex", checked)
-                  }
-                />
+                {draft.unifyCodexHistory ? (
+                  <div className="flex shrink-0 items-center gap-2">
+                    <span className="rounded-md bg-emerald-500/10 px-2 py-1 text-xs font-medium text-emerald-700 dark:text-emerald-300">
+                      {t("historyUnified")}
+                    </span>
+                    <Button
+                      type="button"
+                      size="sm"
+                      variant="outline"
+                      disabled={busy || historyBusy === "codex"}
+                      onClick={() => void applyHistory("codex", null)}
+                    >
+                      {historyBusy === "codex" ? (
+                        <LoaderCircle className="animate-spin" />
+                      ) : (
+                        <History />
+                      )}
+                      {t("reunify")}
+                    </Button>
+                  </div>
+                ) : (
+                  <Switch
+                    className="disabled:opacity-100"
+                    checked={false}
+                    disabled={busy || historyBusy === "codex"}
+                    aria-label={t("codexUnifiedHistory")}
+                    onCheckedChange={(checked) =>
+                      void setHistoryEnabled("codex", checked)
+                    }
+                  />
+                )}
               </div>
               {codexHistory ? (
                 <div className="border-t border-border pt-3">

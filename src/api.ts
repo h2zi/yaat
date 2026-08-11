@@ -7,10 +7,13 @@ import type {
   BootstrapResponse,
   CreateProviderRequest,
   ImportCurrentRequest,
+  ModelFetchRequest,
+  ModelFetchResponse,
   HistoryApplyRequest,
   HistoryApplyResult,
   HistoryPreview,
   HistoryPreviewRequest,
+  HistorySyncStatus,
   OperationProgress,
   OperationResult,
   Platform,
@@ -33,6 +36,7 @@ const commands = {
   createProvider: "provider_create",
   updateProvider: "provider_update",
   getProviderCredential: "provider_credential_get",
+  fetchProviderModels: "provider_models_fetch",
   deleteProvider: "provider_delete",
   activateProvider: "provider_activate",
   deactivateGlobal: "provider_global_deactivate",
@@ -47,6 +51,7 @@ const commands = {
   previewHistory: "history_preview",
   applyHistory: "history_apply",
   cancelHistory: "history_cancel",
+  historySyncStatus: "history_sync_status",
 } as const;
 
 type CommandName = (typeof commands)[keyof typeof commands];
@@ -139,6 +144,13 @@ export const api = {
       ? previewApi.getProviderCredential(id)
       : request(commands.getProviderCredential, { id }),
 
+  fetchProviderModels: (
+    value: ModelFetchRequest,
+  ): Promise<ModelFetchResponse> =>
+    preview
+      ? previewApi.fetchProviderModels(value)
+      : request(commands.fetchProviderModels, value),
+
   deleteProvider: (id: string): Promise<OperationResult> =>
     preview
       ? previewApi.deleteProvider(id)
@@ -222,4 +234,9 @@ export const api = {
 
   cancelHistory: (): Promise<void> =>
     preview ? Promise.resolve() : request(commands.cancelHistory),
+
+  historySyncStatus: (): Promise<HistorySyncStatus[]> =>
+    preview
+      ? previewApi.historySyncStatus()
+      : request(commands.historySyncStatus),
 };

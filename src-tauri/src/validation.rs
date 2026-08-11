@@ -1,8 +1,11 @@
 //! Validation shared by Tauri commands and platform adapters.
 
+use std::collections::HashSet;
+
 use url::Url;
 use yaat_contracts::{
-    CreateProviderRequest, ProviderKind, ProviderProfile, SecretKind, UpdateProviderRequest,
+    CreateProviderRequest, HeaderEntry, ModelFetchRequest, Platform, ProviderKind,
+    ProviderPlatformConfig, ProviderProfile, SecretKind, UpdateProviderRequest,
 };
 
 use crate::error::{AppError, AppResult};
@@ -11,6 +14,13 @@ pub fn validate_create(request: &CreateProviderRequest) -> AppResult<()> {
     validate_name(&request.name)?;
     validate_account_label(request.account_label.as_deref())?;
     validate_official_credential_field(request.kind, request.official_credential.as_deref())?;
+    validate_provider_extras(
+        request.platform,
+        &request.custom_headers,
+        request.user_agent.as_deref(),
+        &request.platform_config,
+        request.model.as_deref(),
+    )?;
     validate_profile_shape(
         request.kind,
         request.base_url.as_deref(),
@@ -25,6 +35,7 @@ pub fn validate_update(request: &UpdateProviderRequest) -> AppResult<()> {
     crate::paths::validate_identifier(&request.id)?;
     validate_name(&request.name)?;
     validate_account_label(request.account_label.as_deref())?;
+    validate_headers(&request.custom_headers, request.user_agent.as_deref())?;
     if let Some(secret) = request.replacement_secret.as_deref() {
         validate_secret(secret)?;
     }
@@ -34,6 +45,17 @@ pub fn validate_update(request: &UpdateProviderRequest) -> AppResult<()> {
     validate_optional_model(request.model.as_deref())
 }
 
+pub fn validate_model_fetch(request: &ModelFetchRequest) -> AppResult<()> {
+    validate_provider_url(&request.base_url)?;
+    if request.secret_kind == SecretKind::None {
+        return Err(AppError::Validation(
+            "model discovery requires a credential".into(),
+        ));
+    }
+    validate_secret(&request.credential)?;
+    validate_headers(&request.custom_headers, request.user_agent.as_deref())
+}
+
 pub fn validate_existing_profile_update(
     current: &ProviderProfile,
     request: &UpdateProviderRequest,
@@ -41,6 +63,13 @@ pub fn validate_existing_profile_update(
     validate_official_credential_field(
         current.kind,
         request.replacement_official_credential.as_deref(),
+    )?;
+    validate_provider_extras(
+        current.platform,
+        &request.custom_headers,
+        request.user_agent.as_deref(),
+        &request.platform_config,
+        request.model.as_deref(),
     )?;
     validate_profile_shape(
         current.kind,
@@ -180,6 +209,176 @@ fn validate_optional_model(model: Option<&str>) -> AppResult<()> {
 fn validate_secret(secret: &str) -> AppResult<()> {
     if secret.is_empty() || secret.len() > 16 * 1024 || secret.contains(['\r', '\n', '\0']) {
         return Err(AppError::Validation("credential value is invalid".into()));
+    }
+    Ok(())
+}
+
+fn validate_provider_extras(
+    platform: Platform,
+    headers: &[HeaderEntry],
+    user_agent: Option<&str>,
+    config: &ProviderPlatformConfig,
+    selected_model: Option<&str>,
+) -> AppResult<()> {
+    validate_headers(headers, user_agent)?;
+    let matches_platform = matches!(
+        (platform, config),
+        (Platform::Codex, ProviderPlatformConfig::Codex { .. })
+            | (
+                Platform::ClaudeCode,
+                ProviderPlatformConfig::ClaudeCode { .. }
+            )
+            | (
+                Platform::ClaudeDesktop,
+                ProviderPlatformConfig::ClaudeDesktop { .. }
+            )
+    );
+    if !matches_platform {
+        return Err(AppError::Validation(
+            "provider platform configuration does not match its client".into(),
+        ));
+    }
+    match config {
+        ProviderPlatformConfig::Codex {
+            default_model,
+            catalog,
+        } => {
+            validate_optional_model(default_model.as_deref())?;
+            if default_model.as_deref() != selected_model {
+                return Err(AppError::Validation(
+                    "Codex default model fields are inconsistent".into(),
+                ));
+            }
+            let mut ids = HashSet::new();
+            for model in catalog {
+                validate_optional_model(Some(&model.id))?;
+                if !ids.insert(model.id.to_ascii_lowercase()) {
+                    return Err(AppError::Validation(
+                        "Codex catalog model IDs must be unique".into(),
+                    ));
+                }
+                if model.display_name.trim().is_empty()
+                    || model.display_name.chars().count() > 160
+                    || model.display_name.chars().any(char::is_control)
+                    || model.description.chars().count() > 1000
+                    || model.description.chars().any(char::is_control)
+                    || model.context_window == 0
+                    || model.supported_reasoning_efforts.is_empty()
+                    || !model
+                        .supported_reasoning_efforts
+                        .contains(&model.default_reasoning_effort)
+                {
+                    return Err(AppError::Validation(
+                        "Codex catalog contains an invalid model entry".into(),
+                    ));
+                }
+            }
+            if !catalog.is_empty() {
+                let selected = default_model.as_deref().ok_or_else(|| {
+                    AppError::Validation("a Codex catalog requires a default model".into())
+                })?;
+                if !catalog.iter().any(|model| model.id == selected) {
+                    return Err(AppError::Validation(
+                        "the default Codex model must exist in its catalog".into(),
+                    ));
+                }
+            }
+        }
+        ProviderPlatformConfig::ClaudeCode {
+            default_model,
+            sonnet,
+            opus,
+            haiku,
+            fable,
+            subagent,
+        } => {
+            if default_model.as_deref() != selected_model {
+                return Err(AppError::Validation(
+                    "Claude Code default model fields are inconsistent".into(),
+                ));
+            }
+            for model in [default_model, sonnet, opus, haiku, fable, subagent] {
+                validate_optional_model(model.as_deref())?;
+            }
+        }
+        ProviderPlatformConfig::ClaudeDesktop { models } => {
+            let mut unique = HashSet::new();
+            for model in models {
+                validate_optional_model(Some(model))?;
+                if !unique.insert(model.to_ascii_lowercase()) {
+                    return Err(AppError::Validation(
+                        "Claude Desktop model IDs must be unique".into(),
+                    ));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_headers(headers: &[HeaderEntry], user_agent: Option<&str>) -> AppResult<()> {
+    if headers.len() > 64 {
+        return Err(AppError::Validation(
+            "a provider can define at most 64 custom headers".into(),
+        ));
+    }
+    let mut names = HashSet::new();
+    const FORBIDDEN: &[&str] = &[
+        "authorization",
+        "connection",
+        "content-length",
+        "host",
+        "keep-alive",
+        "proxy-authenticate",
+        "proxy-authorization",
+        "te",
+        "trailer",
+        "transfer-encoding",
+        "upgrade",
+        "user-agent",
+        "x-api-key",
+    ];
+    for header in headers {
+        let name = header.name.trim();
+        let normalized = name.to_ascii_lowercase();
+        let valid_name = !name.is_empty()
+            && name.len() <= 128
+            && name.bytes().all(|byte| {
+                byte.is_ascii_alphanumeric()
+                    || matches!(
+                        byte,
+                        b'!' | b'#'
+                            | b'$'
+                            | b'%'
+                            | b'&'
+                            | b'\''
+                            | b'*'
+                            | b'+'
+                            | b'-'
+                            | b'.'
+                            | b'^'
+                            | b'_'
+                            | b'`'
+                            | b'|'
+                            | b'~'
+                    )
+            });
+        if !valid_name
+            || !names.insert(normalized.clone())
+            || FORBIDDEN.contains(&normalized.as_str())
+            || header.value.len() > 8192
+            || header.value.contains(['\r', '\n', '\0'])
+        {
+            return Err(AppError::Validation(format!(
+                "invalid or conflicting custom header: {}",
+                header.name
+            )));
+        }
+    }
+    if let Some(value) = user_agent
+        && (value.trim().is_empty() || value.len() > 512 || value.contains(['\r', '\n', '\0']))
+    {
+        return Err(AppError::Validation("User-Agent is invalid".into()));
     }
     Ok(())
 }

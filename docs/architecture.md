@@ -56,12 +56,14 @@ commands ── 输入验证、事务编排、稳定 IPC 错误
 每个账号使用独立目录：
 
 ```text
-<YAAT_DATA>/profiles/<platform>/<profile_id>/home
+~/.yaat/profiles/<platform>/<profile_id>/home
 ```
 
-Codex / Claude Code 通过 `CODEX_HOME` / `CLAUDE_CONFIG_DIR` 使用该目录，并在用户选择的绝对项目目录中打开新的可见终端。macOS 使用 Terminal，Linux 使用系统 `x-terminal-emulator`，Windows 使用 Windows Terminal。动态参数逐项传递或严格 shell quoting；API Key 不进入命令行，而由 YAAT 凭据助手按需输出。
+Codex / Claude Code 通过 `CODEX_HOME` / `CLAUDE_CONFIG_DIR` 使用该目录，并在用户选择的绝对项目目录中打开新的可见终端。macOS 使用 Terminal，Linux 使用系统 `x-terminal-emulator`，Windows 使用 Windows Terminal。动态参数逐项传递或严格 shell quoting；API Key 不进入命令行，而是直接写入隔离配置的客户端原生凭据字段。
 
-Claude Desktop 使用独立 `CLAUDE_USER_DATA_DIR` 直接启动。官方账号捕获 `lastKnownAccountUuid`、经 Electron Safe Storage 解密的 OAuth Cache 和明确列出的认证 Cookie；Local Storage、IndexedDB、主题、扩展及其他 Cookie 不属于 YAAT。第三方直连 Provider 只写隔离目录内 YAAT 自有的 config-library 条目和无密钥 helper wrapper。
+YAAT 的 SQLite、隔离 profile、Codex model catalog 与备份都从唯一路径模块解析到用户 home 下的 `.yaat`。`YAAT_DATA_DIR` 只用于开发、测试和便携部署显式覆盖；旧 Application Support 目录不读取、不迁移、不删除。
+
+Claude Desktop 使用独立 `CLAUDE_USER_DATA_DIR` 直接启动。官方账号捕获 `lastKnownAccountUuid`、经 Electron Safe Storage 解密的 OAuth Cache 和明确列出的认证 Cookie；Local Storage、IndexedDB、主题、扩展及其他 Cookie 不属于 YAAT。第三方直连 Provider 把凭据、认证类型、请求头、User-Agent 和模型写入隔离目录内 YAAT 自有的 config-library 条目。
 
 ## 全局切换
 
@@ -74,8 +76,8 @@ Claude Desktop 使用独立 `CLAUDE_USER_DATA_DIR` 直接启动。官方账号�
   → 后续切换：保留原始 before，只更新最新 after
   → 原子提交配置
   → 官方账号：复制并读回验证目标私有凭据
-  → 写入 global_profile_id
-  → 可选历史同步
+  → 写入 global_profile_id 并立即返回
+  → 可选历史增量任务进入后台队列
 ```
 
 单次操作失败时，当前进程直接恢复本次切换前的凭据、回滚已经提交的字段补丁，并把数据库中的基线恢复到操作前状态。基线在外部写入前落库；后续全局应用会继续复用同一份首次接管基线，不增加单独的恢复状态机。
@@ -102,7 +104,7 @@ Claude Desktop 使用独立 `CLAUDE_USER_DATA_DIR` 直接启动。官方账号�
 - 同目录临时文件同步后原子发布，并保留权限。
 - 注释、键顺序、BOM、CRLF 与未知字段由 CST / `toml_edit` 路径补丁保留。
 
-Codex 只接管模型 / Provider 选择字段和 `model_providers.yaat_managed_v1`，不修改 `cli_auth_credentials_store`、MCP、权限、沙箱或其他 Provider。Claude Code 只接管 `apiKeyHelper` 及 `env` 中的 Anthropic / Claude Provider 选择字段，不修改 permissions、MCP、插件、主题或其他未知字段。
+Codex 只接管模型 / Provider 选择字段、`model_providers.custom` 和可选 `model_catalog_json`；对象以显式 TOML 表多行写入，不压成 inline table。Claude Code 只接管 `env` 中的 Anthropic / Claude Provider 选择、直接凭据、模型映射和请求头字段；激活时会移除当前客户端配置中 YAAT 旧版遗留的 `apiKeyHelper`，但不会读取或迁移旧 YAAT 数据库。两者都不修改 permissions、MCP、插件、主题或其他未知字段。
 
 Claude Desktop 官方账号只接管 `config.json` 中的 `lastKnownAccountUuid`、`oauth:tokenCache`、`oauth:tokenCacheV2` 和 Cookies 数据库中的认证 Cookie 行。Token Cache 与 Cookie 在捕获时由 Claude Safe Storage 解密，以可回显的账号快照保存到 YAAT SQLite；恢复时使用目标 Profile 的 Safe Storage 重新编码。3P 模式只接管默认配置的 `deploymentMode`、YAAT 固定 config-library 条目和 `appliedId`；恢复时保留管理期间新增的其他 library 条目。
 
@@ -142,17 +144,17 @@ Claude Desktop 快照包含账号 UUID、两套解密后的 OAuth Cache，以及
 
 - Codex：`sessions`、`archived_sessions`、`.jsonl`、`.jsonl.zst`。
 - Claude Code：`projects` JSONL，处理子代理、重放、初步 / 最终批次和缓存 Token。
-- 每次扫描重建平台快照；查询最长 366 天并按 IANA 时区聚合。
+- 源文件按路径、大小、mtime 和指纹增量索引；复制历史的同一逻辑事件只统计一次。查询最长 366 天并按 IANA 时区聚合，支持模型过滤、自动刷新和缓存命中率。
 - Claude Desktop 与远程配额不在第一版统计范围。
 
 ## 会话历史
 
 - 扫描不跟随目录中的符号链接，但允许用户配置的历史根本身是正常符号链接。
 - 同名同内容跳过；缺失会话复制；一份会话严格扩展其他所有版本时使用最长版本更新目标；真正分叉报告冲突且不覆盖。
-- Codex 只修正 provider 元数据并同步缺失 rollout，不写 `state_5.sqlite`。
+- Codex 首次统一和“重新统一”会幂等修正 JSONL / Zstd 中的两处 provider 元数据与 `state_5.sqlite.threads.model_provider`，统一为 `custom`；启用后不可关闭。
 - Claude Code 只同步各配置根的 `projects` JSONL。
 - Claude Desktop 只处理 `claude-code-sessions/<账号>/<组织>/local_*.json`，目标必须来自扫描结果；Chat / Cowork 不参与。
-- 自动同步默认关闭。隔离启动在打开客户端前尝试同步；全局切换成功后同步。失败通过 `OperationResult.warning` 明确显示，不伪装成成功信息，也不撤销已经完成的账号操作。
+- 自动同步默认关闭。账号激活和隔离启动只投递后台增量任务，不在切换成功返回前枚举历史目录。Claude Code 关闭后只停止后续同步，不删除已复制会话。同步失败只更新状态，不撤销已经成功的账号操作。
 
 ## 当前限制
 
@@ -162,4 +164,4 @@ Claude Desktop 快照包含账号 UUID、两套解密后的 OAuth Cache，以及
 
 ## Docker 验证
 
-`docker/app-build.Dockerfile` 在容器内执行 workspace check、Clippy、`-D warnings` Rust 文档、Rust 测试、TypeScript/Vite 构建和 Tauri 无 bundle 构建；`docker/windows-check.Dockerfile` 交叉检查 `x86_64-pc-windows-gnu` 的全部 Rust targets。`scripts/test-codex-docker.sh` 安装固定官方 Codex，使用虚构凭据与容器内 mock Responses 服务验证严格配置、凭据 helper、官方账号字段复制和无关配置保留；容器运行阶段禁网并移除 capabilities。
+`docker/app-build.Dockerfile` 在容器内执行 workspace check、Clippy、`-D warnings` Rust 文档、Rust 测试、TypeScript/Vite 构建和 Tauri 无 bundle 构建；`docker/windows-check.Dockerfile` 交叉检查 `x86_64-pc-windows-gnu` 的全部 Rust targets。`scripts/test-codex-docker.sh` 使用 Codex `0.147.0` 和容器内 mock Responses 服务验证严格配置、直接凭据、官方账号字段复制和无关配置保留；Claude Code 互操作基线是 `2.1.226`。容器运行阶段禁网并移除 capabilities。

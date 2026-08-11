@@ -7,8 +7,7 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use yaat_contracts::{Platform, ProviderKind, SecretKind};
-use zeroize::Zeroize;
+use yaat_contracts::{HeaderEntry, Platform, ProviderKind, ProviderPlatformConfig, SecretKind};
 
 use crate::activation::{
     ConfigFormat, OwnedPath, PatchEngine, PatchOperation, remove_atomically, replace_atomically,
@@ -28,16 +27,19 @@ const OFFICIAL_API_BASE_URL: &str = "https://api.anthropic.com";
 const MAX_JSON_BYTES: u64 = 4 * 1024 * 1024;
 const CREDENTIAL_STORAGE_KIND: &str = "claude_desktop_credential_v1";
 
-#[derive(Deserialize, Serialize, Zeroize)]
+#[derive(Deserialize, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 enum DesktopCredential {
     Account {
         data: claude_desktop_credentials::AccountData,
     },
     GatewayTarget {
-        profile_id: String,
+        credential: String,
+        secret_kind: SecretKind,
         base_url: String,
-        model: Option<String>,
+        models: Vec<String>,
+        custom_headers: Vec<HeaderEntry>,
+        user_agent: Option<String>,
     },
     GatewayState {
         meta_existed: bool,
@@ -45,7 +47,6 @@ enum DesktopCredential {
         applied_id: Option<Vec<u8>>,
         meta_entry: Option<Vec<u8>>,
         entry: Option<Vec<u8>>,
-        helper: Option<Vec<u8>>,
     },
 }
 
@@ -65,12 +66,12 @@ impl ClaudeDesktopAdapter {
         ensure_profile(runtime)?;
         crate::paths::validate_identifier(&runtime.profile.id)
             .map_err(|error| error.to_string())?;
-        Ok(context
-            .app_data_dir
-            .join("profiles")
-            .join(Platform::ClaudeDesktop.as_str())
-            .join(&runtime.profile.id)
-            .join("home"))
+        crate::paths::managed_profile_home_at(
+            &context.data_root,
+            Platform::ClaudeDesktop,
+            &runtime.profile.id,
+        )
+        .map_err(|error| error.to_string())
     }
 
     fn prepare_deployment_mode(root: &Path, mode: &str) -> Result<(), String> {
@@ -88,7 +89,7 @@ impl ClaudeDesktopAdapter {
 
     fn prepare_gateway_profile(
         &self,
-        context: &AdapterContext,
+        _context: &AdapterContext,
         runtime: &ProfileRuntime<'_>,
         root: &Path,
     ) -> Result<(), String> {
@@ -99,12 +100,15 @@ impl ClaudeDesktopAdapter {
         ) {
             return Err("only API-backed Claude Desktop profiles use 3P gateway mode".into());
         }
-        if profile.secret_kind != SecretKind::ApiKey || !profile.has_secret {
-            return Err("Claude Desktop gateway profiles require an API key stored in YAAT".into());
+        if !matches!(
+            profile.secret_kind,
+            SecretKind::ApiKey | SecretKind::BearerToken
+        ) || !profile.has_secret
+        {
+            return Err("Claude Desktop gateway profiles require a stored credential".into());
         }
-        let secret_ref = runtime.secret_ref.ok_or_else(|| {
-            "Claude Desktop gateway profile has no credential reference in the local database"
-                .to_string()
+        let secret = runtime.secret.ok_or_else(|| {
+            "Claude Desktop gateway profile has no credential in the local database".to_string()
         })?;
         let base_url = match profile.kind {
             ProviderKind::OfficialApi => {
@@ -124,13 +128,17 @@ impl ClaudeDesktopAdapter {
             ProviderKind::OfficialSubscription => unreachable!(),
         };
 
-        let model = profile
-            .model
-            .as_deref()
-            .map(str::trim)
-            .filter(|value| !value.is_empty());
-        validate_direct_model(model, profile.kind == ProviderKind::ThirdParty)?;
-        prepare_gateway_config(context, root, secret_ref, &base_url, model)
+        let models = desktop_models(profile)?;
+        validate_direct_models(&models, profile.kind == ProviderKind::ThirdParty)?;
+        prepare_gateway_config(
+            root,
+            secret,
+            profile.secret_kind,
+            &base_url,
+            &models,
+            &profile.custom_headers,
+            profile.user_agent.as_deref(),
+        )
     }
 
     fn launch_command(
@@ -161,6 +169,7 @@ impl ClaudeDesktopAdapter {
 
 pub(crate) fn global_credential_for_profile(
     profile: &yaat_contracts::ProviderProfile,
+    secret: &str,
 ) -> Result<CredentialSnapshot, String> {
     if profile.platform != Platform::ClaudeDesktop
         || !matches!(
@@ -172,8 +181,12 @@ pub(crate) fn global_credential_for_profile(
             "only API-backed Claude Desktop profiles use a generated global credential".into(),
         );
     }
-    if profile.secret_kind != SecretKind::ApiKey || !profile.has_secret {
-        return Err("Claude Desktop gateway profiles require a saved API key".into());
+    if !matches!(
+        profile.secret_kind,
+        SecretKind::ApiKey | SecretKind::BearerToken
+    ) || !profile.has_secret
+    {
+        return Err("Claude Desktop gateway profiles require a saved credential".into());
     }
     crate::paths::validate_identifier(&profile.id).map_err(|error| error.to_string())?;
     let base_url = match profile.kind {
@@ -192,17 +205,16 @@ pub(crate) fn global_credential_for_profile(
         }
         ProviderKind::OfficialSubscription => unreachable!(),
     };
-    let model = profile
-        .model
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty());
-    validate_direct_model(model, profile.kind == ProviderKind::ThirdParty)?;
+    let models = desktop_models(profile)?;
+    validate_direct_models(&models, profile.kind == ProviderKind::ThirdParty)?;
     encode_credential(
         DesktopCredential::GatewayTarget {
-            profile_id: profile.id.clone(),
+            credential: secret.to_owned(),
+            secret_kind: profile.secret_kind,
             base_url,
-            model: model.map(str::to_owned),
+            models,
+            custom_headers: profile.custom_headers.clone(),
+            user_agent: profile.user_agent.clone(),
         },
         None,
         None,
@@ -210,27 +222,33 @@ pub(crate) fn global_credential_for_profile(
 }
 
 fn prepare_gateway_config(
-    context: &AdapterContext,
     root: &Path,
-    profile_id: &str,
+    credential: &str,
+    secret_kind: SecretKind,
     base_url: &str,
-    model: Option<&str>,
+    models: &[String],
+    custom_headers: &[HeaderEntry],
+    user_agent: Option<&str>,
 ) -> Result<(), String> {
-    crate::paths::validate_identifier(profile_id).map_err(|error| error.to_string())?;
-    let helper = prepare_helper_wrapper(context, root, profile_id)?;
-
     let mut value = json!({
         "disableDeploymentModeChooser": true,
         "inferenceProvider": "gateway",
         "inferenceGatewayBaseUrl": base_url,
-        "inferenceGatewayAuthScheme": "bearer",
-        "inferenceCredentialHelper": helper.to_string_lossy(),
-        "inferenceCredentialHelperTtlSec": 300,
-        "inferenceCredentialHelperTimeoutSec": 30,
-        "inferenceCredentialHelperSilentRefreshEnabled": true
+        "inferenceGatewayApiKey": credential,
+        "inferenceGatewayAuthScheme": if secret_kind == SecretKind::ApiKey { "x-api-key" } else { "bearer" }
     });
-    if let Some(model) = model {
-        value["inferenceModels"] = json!([model]);
+    if !models.is_empty() {
+        value["inferenceModels"] = json!(models);
+    }
+    let mut headers = custom_headers
+        .iter()
+        .map(|entry| (entry.name.clone(), Value::String(entry.value.clone())))
+        .collect::<serde_json::Map<_, _>>();
+    if let Some(user_agent) = user_agent.filter(|value| !value.trim().is_empty()) {
+        headers.insert("User-Agent".into(), Value::String(user_agent.trim().into()));
+    }
+    if !headers.is_empty() {
+        value["inferenceCustomHeaders"] = Value::Object(headers);
     }
 
     let library = root.join(CONFIG_LIBRARY_DIR);
@@ -344,7 +362,7 @@ impl PlatformAdapter for ClaudeDesktopAdapter {
 
     fn restore_credentials(
         &self,
-        context: &AdapterContext,
+        _context: &AdapterContext,
         config_root: &Path,
         snapshot: &CredentialSnapshot,
     ) -> Result<(), String> {
@@ -353,15 +371,20 @@ impl PlatformAdapter for ClaudeDesktopAdapter {
                 claude_desktop_credentials::restore(config_root, &data)
             }
             DesktopCredential::GatewayTarget {
-                profile_id,
+                credential,
+                secret_kind,
                 base_url,
-                model,
+                models,
+                custom_headers,
+                user_agent,
             } => prepare_gateway_config(
-                context,
                 &global_gateway_root(config_root)?,
-                &profile_id,
+                &credential,
+                secret_kind,
                 &base_url,
-                model.as_deref(),
+                &models,
+                &custom_headers,
+                user_agent.as_deref(),
             ),
             DesktopCredential::GatewayState {
                 meta_existed,
@@ -369,7 +392,6 @@ impl PlatformAdapter for ClaudeDesktopAdapter {
                 applied_id,
                 meta_entry,
                 entry,
-                helper,
             } => restore_gateway_state(
                 config_root,
                 meta_existed,
@@ -377,7 +399,6 @@ impl PlatformAdapter for ClaudeDesktopAdapter {
                 applied_id,
                 meta_entry,
                 entry,
-                helper,
             ),
         }
     }
@@ -415,6 +436,7 @@ impl PlatformAdapter for ClaudeDesktopAdapter {
                 OwnedPath::from_segments(["deploymentMode"]).map_err(|error| error.to_string())?,
                 Value::String(mode.into()),
             )],
+            sidecars: Vec::new(),
         })
     }
 }
@@ -470,7 +492,6 @@ fn capture_gateway_state(config_root: &Path) -> Result<CredentialSnapshot, Strin
         applied_id,
         meta_entry,
         entry: read_optional_file(&library.join(format!("{PROFILE_ID}.json")), MAX_JSON_BYTES)?,
-        helper: read_optional_file(&helper_path(&root), 64 * 1024)?,
     };
     encode_credential(credential, None, None)
 }
@@ -482,7 +503,6 @@ fn restore_gateway_state(
     applied_id: Option<Vec<u8>>,
     meta_entry: Option<Vec<u8>>,
     entry: Option<Vec<u8>>,
-    helper: Option<Vec<u8>>,
 ) -> Result<(), String> {
     let root = global_gateway_root(config_root)?;
     let library = root.join(CONFIG_LIBRARY_DIR);
@@ -497,14 +517,6 @@ fn restore_gateway_state(
         &library.join(format!("{PROFILE_ID}.json")),
         entry.as_deref(),
     )?;
-    let helper_path = helper_path(&root);
-    restore_optional_file(&helper_path, helper.as_deref())?;
-    #[cfg(unix)]
-    if helper.is_some() {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(&helper_path, fs::Permissions::from_mode(0o700))
-            .map_err(|error| error.to_string())?;
-    }
     Ok(())
 }
 
@@ -566,14 +578,6 @@ fn global_gateway_root(config_root: &Path) -> Result<PathBuf, String> {
     Ok(config_root.with_file_name(format!("{name}-3p")))
 }
 
-fn helper_path(root: &Path) -> PathBuf {
-    #[cfg(windows)]
-    let name = "credential.ps1";
-    #[cfg(not(windows))]
-    let name = "credential.sh";
-    root.join("yaat-helpers").join(name)
-}
-
 fn read_optional_file(path: &Path, maximum: u64) -> Result<Option<Vec<u8>>, String> {
     match fs::metadata(path) {
         Ok(metadata) => {
@@ -613,7 +617,7 @@ fn ensure_profile(runtime: &ProfileRuntime<'_>) -> Result<(), String> {
         ProviderKind::OfficialSubscription => {
             if runtime.profile.secret_kind != SecretKind::None
                 || runtime.profile.has_secret
-                || runtime.secret_ref.is_some()
+                || runtime.secret.is_some()
                 || runtime.profile.base_url.is_some()
             {
                 return Err(
@@ -640,6 +644,35 @@ pub(crate) fn validate_direct_model(model: Option<&str>, required: bool) -> Resu
         );
     }
     Ok(())
+}
+
+fn validate_direct_models(models: &[String], required: bool) -> Result<(), String> {
+    if required && models.is_empty() {
+        return Err("a direct Claude Desktop provider requires at least one model".into());
+    }
+    for model in models {
+        validate_direct_model(Some(model), true)?;
+    }
+    Ok(())
+}
+
+fn desktop_models(profile: &yaat_contracts::ProviderProfile) -> Result<Vec<String>, String> {
+    let ProviderPlatformConfig::ClaudeDesktop { models } = &profile.platform_config else {
+        return Err("Claude Desktop profile has mismatched platform config".into());
+    };
+    let mut values = models.clone();
+    if values.is_empty()
+        && let Some(model) = profile
+            .model
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+    {
+        values.push(model.to_owned());
+    }
+    values.sort();
+    values.dedup();
+    Ok(values)
 }
 
 fn is_safe_direct_model(value: &str) -> bool {
@@ -682,104 +715,6 @@ fn write_json_atomic(path: &Path, value: &Value) -> Result<(), String> {
     replace_atomically(path, &bytes)
         .map(|_| ())
         .map_err(|error| error.to_string())
-}
-
-fn prepare_helper_wrapper(
-    context: &AdapterContext,
-    root: &Path,
-    profile_id: &str,
-) -> Result<PathBuf, String> {
-    if !context.helper_executable.is_absolute() {
-        return Err("YAAT credential helper path must be absolute".into());
-    }
-    if context
-        .helper_executable
-        .to_string_lossy()
-        .chars()
-        .any(|character| matches!(character, '\0' | '\r' | '\n'))
-    {
-        return Err("YAAT credential helper path contains control characters".into());
-    }
-    crate::paths::validate_identifier(profile_id).map_err(|error| error.to_string())?;
-    let directory = root.join("yaat-helpers");
-    crate::paths::ensure_private_directory(&directory).map_err(|error| error.to_string())?;
-
-    #[cfg(windows)]
-    let (path, bytes) = {
-        let path = directory.join("credential.ps1");
-        let executable = powershell_quote(&context.helper_executable.to_string_lossy());
-        let profile = powershell_quote(profile_id);
-        (
-            path,
-            format!(
-                "$ErrorActionPreference = 'Stop'\r\n& {executable} '--yaat-credential-helper' 'claude_desktop' {profile}\r\nexit $LASTEXITCODE\r\n"
-            )
-            .into_bytes(),
-        )
-    };
-    #[cfg(not(windows))]
-    let (path, bytes) = {
-        let path = directory.join("credential.sh");
-        let executable = shell_quote(&context.helper_executable.to_string_lossy());
-        let profile = shell_quote(profile_id);
-        (
-            path,
-            format!(
-                "#!/bin/sh\nexec {executable} --yaat-credential-helper claude_desktop {profile}\n"
-            )
-            .into_bytes(),
-        )
-    };
-
-    if path
-        .to_string_lossy()
-        .chars()
-        .any(|character| character == '"' || character == '%' || character.is_control())
-    {
-        return Err(
-            "Claude Desktop rejects credential-helper paths containing quotes, percent signs, or control characters"
-                .into(),
-        );
-    }
-
-    validate_regular_helper(&path)?;
-    replace_atomically(&path, &bytes).map_err(|error| error.to_string())?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(&path, fs::Permissions::from_mode(0o700))
-            .map_err(|error| error.to_string())?;
-    }
-    Ok(path)
-}
-
-fn validate_regular_helper(path: &Path) -> Result<(), String> {
-    match fs::metadata(path) {
-        Ok(metadata) => {
-            if !metadata.file_type().is_file() {
-                return Err(format!(
-                    "refusing non-regular YAAT helper {}",
-                    path.display()
-                ));
-            }
-            if metadata.len() > 64 * 1024 {
-                return Err("YAAT helper wrapper is unexpectedly large".into());
-            }
-            Ok(())
-        }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(error) => Err(error.to_string()),
-    }
-}
-
-#[cfg(not(windows))]
-fn shell_quote(value: &str) -> String {
-    format!("'{}'", value.replace('\'', "'\\''"))
-}
-
-#[cfg(windows)]
-fn powershell_quote(value: &str) -> String {
-    format!("'{}'", value.replace('\'', "''"))
 }
 
 fn read_json_object(path: &Path) -> Result<Value, String> {
@@ -857,6 +792,11 @@ mod tests {
             base_url: (kind == ProviderKind::ThirdParty)
                 .then(|| "https://gateway.example.com".into()),
             model: model.map(str::to_owned),
+            custom_headers: Vec::new(),
+            user_agent: None,
+            platform_config: ProviderPlatformConfig::ClaudeDesktop {
+                models: model.into_iter().map(str::to_owned).collect(),
+            },
             secret_kind: if kind == ProviderKind::OfficialSubscription {
                 SecretKind::None
             } else {
@@ -869,11 +809,8 @@ mod tests {
     }
 
     fn context(temp: &Path) -> AdapterContext {
-        let executable = temp.join("yaat");
-        fs::write(&executable, b"helper").unwrap();
         AdapterContext {
-            app_data_dir: temp.join("data"),
-            helper_executable: executable,
+            data_root: temp.join("data"),
             explicit_cli_path: None,
             explicit_config_root: None,
         }
@@ -885,7 +822,7 @@ mod tests {
         let context = context(temp.path());
         let profile = profile(ProviderKind::OfficialSubscription, None);
         let root = context
-            .app_data_dir
+            .data_root
             .join("profiles/claude_desktop/desktop-profile/home");
         fs::create_dir_all(&root).unwrap();
         fs::write(
@@ -898,7 +835,7 @@ mod tests {
                 &context,
                 ProfileRuntime {
                     profile: &profile,
-                    secret_ref: None,
+                    secret: None,
                 },
             )
             .unwrap();
@@ -909,12 +846,12 @@ mod tests {
     }
 
     #[test]
-    fn gateway_profile_uses_helper_and_preserves_other_library_entries() {
+    fn gateway_profile_writes_direct_credential_and_preserves_other_library_entries() {
         let temp = tempfile::tempdir().unwrap();
         let context = context(temp.path());
         let profile = profile(ProviderKind::ThirdParty, Some("claude-sonnet-5"));
         let root = context
-            .app_data_dir
+            .data_root
             .join("profiles/claude_desktop/desktop-profile/home");
         let library = root.join(CONFIG_LIBRARY_DIR);
         fs::create_dir_all(&library).unwrap();
@@ -928,21 +865,16 @@ mod tests {
                 &context,
                 ProfileRuntime {
                     profile: &profile,
-                    secret_ref: Some(&profile.id),
+                    secret: Some("test-secret"),
                 },
             )
             .unwrap();
         let written: Value =
             serde_json::from_slice(&fs::read(library.join(format!("{PROFILE_ID}.json"))).unwrap())
                 .unwrap();
-        assert!(written.get("inferenceGatewayApiKey").is_none());
-        let helper = PathBuf::from(written["inferenceCredentialHelper"].as_str().unwrap());
-        assert!(helper.starts_with(&root));
-        let wrapper = fs::read_to_string(helper).unwrap();
-        assert!(wrapper.contains("--yaat-credential-helper"));
-        assert!(wrapper.contains("claude_desktop"));
-        assert!(wrapper.contains("desktop-profile"));
-        assert!(!wrapper.contains("api-key"));
+        assert_eq!(written["inferenceGatewayApiKey"], "test-secret");
+        assert_eq!(written["inferenceGatewayAuthScheme"], "x-api-key");
+        assert!(written.get("inferenceCredentialHelper").is_none());
         let meta: Value =
             serde_json::from_slice(&fs::read(library.join("_meta.json")).unwrap()).unwrap();
         assert_eq!(meta["unowned"], true);
@@ -972,10 +904,6 @@ mod tests {
         )
         .unwrap();
         fs::write(library.join(format!("{PROFILE_ID}.json")), b"{}").unwrap();
-        let helper = helper_path(&gateway_root);
-        fs::create_dir_all(helper.parent().unwrap()).unwrap();
-        fs::write(&helper, b"generated").unwrap();
-
         ClaudeDesktopAdapter::new()
             .restore_credentials(&context, &config_root, &snapshot)
             .unwrap();
@@ -992,7 +920,6 @@ mod tests {
         assert_eq!(meta["appliedId"], "other");
         assert_eq!(meta["keep"], true);
         assert!(!library.join(format!("{PROFILE_ID}.json")).exists());
-        assert!(!helper.exists());
     }
 
     #[test]

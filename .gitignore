@@ -2,6 +2,7 @@
 node_modules/
 .pnpm-store/
 dist/
+output/
 target/
 tmp/
 src-tauri/gen/

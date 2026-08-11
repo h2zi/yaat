@@ -1,10 +1,10 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import {
   Activity,
   ArrowDownToLine,
   ArrowUpFromLine,
-  CalendarDays,
   DatabaseZap,
+  Gauge,
   LoaderCircle,
   RefreshCw,
   Sigma,
@@ -21,6 +21,7 @@ import {
 } from "recharts";
 
 import { Button } from "@/components/ui/button";
+import { UsageDateRange } from "@/components/usage-date-range";
 import {
   Card,
   CardContent,
@@ -28,8 +29,14 @@ import {
   CardHeader,
   CardTitle,
 } from "@/components/ui/card";
-import { Input } from "@/components/ui/input";
-import type { Translator } from "@/i18n";
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select";
+import type { Language, Translator } from "@/i18n";
 import { dateDaysAgo, formatTokens } from "@/lib/utils";
 import {
   tokenInput,
@@ -42,31 +49,54 @@ import {
 interface UsageDashboardProps {
   platform: Platform;
   timezone: string;
+  language: Language;
   text: Translator;
   loading: boolean;
   progress: OperationProgress | null;
   report: UsageReport | null;
+  active: boolean;
+  refreshIntervalSeconds: 0 | 5 | 10 | 30 | 60;
   onQuery: (
     startDate: string,
     endDate: string,
     rescan?: boolean,
+    model?: string | null,
   ) => Promise<void>;
+  onRefreshIntervalChange: (seconds: 0 | 5 | 10 | 30 | 60) => Promise<void>;
   onCancel: () => Promise<void>;
 }
 
 export function UsageDashboard({
   platform,
   timezone,
+  language,
   text,
   loading,
   progress,
   report,
+  active,
+  refreshIntervalSeconds,
   onQuery,
+  onRefreshIntervalChange,
   onCancel,
 }: UsageDashboardProps) {
   const [startDate, setStartDate] = useState(() => dateDaysAgo(6, timezone));
   const [endDate, setEndDate] = useState(() => dateDaysAgo(0, timezone));
-  const [range, setRange] = useState<"today" | "7" | "30" | "custom">("7");
+  const [range, setRange] = useState<"today" | "7" | "14" | "30" | "custom">(
+    "7",
+  );
+  const [model, setModel] = useState<string | null>(null);
+  const [pageVisible, setPageVisible] = useState(
+    () => document.visibilityState === "visible",
+  );
+  const queryInFlight = useRef(false);
+  const queuedQuery = useRef<{
+    action: "initial" | "range" | "custom" | "rescan";
+    start: string;
+    end: string;
+    rescan: boolean;
+    model: string | null;
+  } | null>(null);
   const [cancelling, setCancelling] = useState(false);
   const [pendingAction, setPendingAction] = useState<
     "initial" | "range" | "custom" | "rescan" | null
@@ -76,15 +106,35 @@ export function UsageDashboard({
     if (!loading) setCancelling(false);
   }, [loading]);
 
-  const runQuery = (
+  function runQuery(
     action: "initial" | "range" | "custom" | "rescan",
     start: string,
     end: string,
     rescan = false,
-  ) => {
+    selectedModel = model,
+  ) {
+    if (queryInFlight.current) {
+      queuedQuery.current = {
+        action,
+        start,
+        end,
+        rescan,
+        model: selectedModel,
+      };
+      return;
+    }
+    queryInFlight.current = true;
     setPendingAction(action);
-    void onQuery(start, end, rescan).finally(() => setPendingAction(null));
-  };
+    void onQuery(start, end, rescan, selectedModel).finally(() => {
+      queryInFlight.current = false;
+      setPendingAction(null);
+      const next = queuedQuery.current;
+      queuedQuery.current = null;
+      if (next) {
+        runQuery(next.action, next.start, next.end, next.rescan, next.model);
+      }
+    });
+  }
 
   useEffect(() => {
     if (range === "custom") {
@@ -92,7 +142,7 @@ export function UsageDashboard({
       return;
     }
     const start = dateDaysAgo(
-      range === "today" ? 0 : range === "7" ? 6 : 29,
+      range === "today" ? 0 : range === "7" ? 6 : range === "14" ? 13 : 29,
       timezone,
     );
     const end = dateDaysAgo(0, timezone);
@@ -101,10 +151,10 @@ export function UsageDashboard({
     runQuery("initial", start, end);
   }, [platform, timezone]);
 
-  const selectRange = (next: "today" | "7" | "30") => {
+  const selectRange = (next: "today" | "7" | "14" | "30") => {
     if (next === range && report) return;
     const start = dateDaysAgo(
-      next === "today" ? 0 : next === "7" ? 6 : 29,
+      next === "today" ? 0 : next === "7" ? 6 : next === "14" ? 13 : 29,
       timezone,
     );
     const end = dateDaysAgo(0, timezone);
@@ -113,6 +163,40 @@ export function UsageDashboard({
     setEndDate(end);
     runQuery("range", start, end);
   };
+
+  const selectCustomRange = (start: string, end: string) => {
+    setRange("custom");
+    setStartDate(start);
+    setEndDate(end);
+    runQuery("custom", start, end);
+  };
+
+  useEffect(() => {
+    const onVisibilityChange = () =>
+      setPageVisible(document.visibilityState === "visible");
+    document.addEventListener("visibilitychange", onVisibilityChange);
+    return () =>
+      document.removeEventListener("visibilitychange", onVisibilityChange);
+  }, []);
+
+  useEffect(() => {
+    if (!active || !pageVisible || refreshIntervalSeconds === 0) return;
+    const timer = window.setInterval(() => {
+      if (!loading && pendingAction === null) {
+        runQuery("range", startDate, endDate, false, model);
+      }
+    }, refreshIntervalSeconds * 1_000);
+    return () => window.clearInterval(timer);
+  }, [
+    active,
+    endDate,
+    loading,
+    model,
+    pageVisible,
+    pendingAction,
+    refreshIntervalSeconds,
+    startDate,
+  ]);
 
   const chartData = useMemo(
     () =>
@@ -154,6 +238,18 @@ export function UsageDashboard({
       tone: "text-emerald-600 bg-emerald-500/9 dark:text-emerald-400",
     },
     {
+      label: text("cacheHitTokens"),
+      value: report?.cacheHitTokens ?? 0,
+      icon: DatabaseZap,
+      tone: "text-cyan-600 bg-cyan-500/9 dark:text-cyan-400",
+    },
+    {
+      label: text("cacheHitRate"),
+      value: `${((report?.cacheHitRate ?? 0) * 100).toFixed(1)}%`,
+      icon: Gauge,
+      tone: "text-violet-600 bg-violet-500/9 dark:text-violet-400",
+    },
+    {
       label: text("requests"),
       value: report?.requestCount ?? 0,
       icon: Activity,
@@ -171,8 +267,6 @@ export function UsageDashboard({
     progress?.total && progress.total > 0
       ? Math.min(100, (progress.processed / progress.total) * 100)
       : null;
-  const rangeIndex =
-    range === "today" ? 0 : range === "7" ? 1 : range === "30" ? 2 : -1;
   const progressPanel = (
     <div className="rounded-xl border border-border bg-card p-4 shadow-card">
       <div className="flex items-center gap-2 text-sm text-muted-foreground">
@@ -247,75 +341,61 @@ export function UsageDashboard({
       {loading && !report ? null : (
         <>
           <div className="mt-6 flex flex-wrap items-center gap-2 rounded-xl border border-border bg-card p-2 shadow-card">
-            <div className="relative grid grid-cols-3 rounded-lg bg-muted/70 p-1">
-              <span
-                aria-hidden="true"
-                data-usage-range-indicator
-                className={`absolute inset-y-1 left-1 rounded-md bg-background shadow-xs transition-[transform,opacity] duration-200 ease-out ${rangeIndex < 0 ? "opacity-0" : "opacity-100"}`}
-                style={{
-                  width: "calc((100% - 0.5rem) / 3)",
-                  transform: `translateX(${Math.max(rangeIndex, 0) * 100}%)`,
-                }}
-              />
-              {(["today", "7", "30"] as const).map((value) => (
-                <button
-                  key={value}
-                  type="button"
-                  disabled={loading || pendingAction === "range"}
-                  onClick={() => selectRange(value)}
-                  className={`relative z-10 h-7 min-w-14 rounded-md px-3 text-xs font-medium transition-colors duration-200 ${range === value ? "text-foreground" : "text-muted-foreground hover:text-foreground"}`}
-                >
-                  {text(
-                    value === "today"
-                      ? "today"
-                      : value === "7"
-                        ? "sevenDays"
-                        : "thirtyDays",
-                  )}
-                </button>
-              ))}
-            </div>
-            <div className="ml-auto flex items-center gap-2">
-              <CalendarDays className="hidden size-4 text-muted-foreground sm:block" />
-              <Input
-                className="h-8 w-[8.6rem] text-xs disabled:opacity-100"
-                type="date"
-                disabled={loading}
-                value={startDate}
-                onChange={(event) => {
-                  setRange("custom");
-                  setStartDate(event.target.value);
-                }}
-              />
-              <span className="text-muted-foreground">—</span>
-              <Input
-                className="h-8 w-[8.6rem] text-xs disabled:opacity-100"
-                type="date"
-                disabled={loading}
-                value={endDate}
-                onChange={(event) => {
-                  setRange("custom");
-                  setEndDate(event.target.value);
-                }}
-              />
-              <Button
-                className="disabled:opacity-100"
-                variant="ghost"
-                size="sm"
-                onClick={() => runQuery("custom", startDate, endDate)}
-                disabled={loading || pendingAction === "custom"}
-              >
-                {pendingAction === "custom" ? (
-                  <LoaderCircle className="animate-spin" />
-                ) : (
-                  <CalendarDays />
-                )}
-                {text("custom")}
-              </Button>
-            </div>
+            <UsageDateRange
+              startDate={startDate}
+              endDate={endDate}
+              range={range}
+              timezone={timezone}
+              language={language}
+              disabled={loading}
+              text={text}
+              onPresetSelect={selectRange}
+              onCustomSelect={selectCustomRange}
+            />
+            <Select
+              value={model ?? "__all__"}
+              onValueChange={(value) => {
+                const next = value === "__all__" ? null : value;
+                setModel(next);
+                runQuery("range", startDate, endDate, false, next);
+              }}
+            >
+              <SelectTrigger className="h-8 w-48">
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem value="__all__">{text("allModels")}</SelectItem>
+                {report?.availableModels.map((value) => (
+                  <SelectItem value={value} key={value}>
+                    {value}
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+            <Select
+              value={String(refreshIntervalSeconds)}
+              onValueChange={(value) =>
+                void onRefreshIntervalChange(
+                  Number(value) as 0 | 5 | 10 | 30 | 60,
+                )
+              }
+            >
+              <SelectTrigger className="ml-auto h-8 w-40">
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                {[0, 5, 10, 30, 60].map((seconds) => (
+                  <SelectItem value={String(seconds)} key={seconds}>
+                    {seconds === 0
+                      ? text("autoRefreshOff")
+                      : `${text("autoRefresh")} · ${seconds}s`}
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
           </div>
 
-          <div className="mt-5 grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
+          <div className="mt-5 grid gap-3 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-6">
             {metric.map(({ label, value, icon: Icon, tone }) => (
               <Card key={label} className="overflow-hidden">
                 <CardContent className="flex items-center gap-4 p-4">
@@ -329,7 +409,7 @@ export function UsageDashboard({
                       {label}
                     </p>
                     <p className="mt-0.5 truncate text-xl font-semibold tracking-[-0.035em] tabular-nums">
-                      {formatTokens(value)}
+                      {typeof value === "number" ? formatTokens(value) : value}
                     </p>
                   </div>
                 </CardContent>

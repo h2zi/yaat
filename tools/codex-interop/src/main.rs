@@ -25,7 +25,7 @@ use yaat_contracts::{Platform, ProfileStatus, ProviderKind, ProviderProfile, Sec
 mod activation;
 
 mod history {
-    pub const CODEX_HISTORY_PROVIDER_ID: &str = "yaat_managed_v1";
+    pub const CODEX_HISTORY_PROVIDER_ID: &str = "custom";
 }
 
 mod process {
@@ -90,18 +90,36 @@ mod paths {
 
     use yaat_contracts::Platform;
 
-    pub fn managed_profile_home(platform: Platform, profile_id: &str) -> Result<PathBuf, String> {
+    pub fn managed_profile_home_at(
+        data_root: &Path,
+        platform: Platform,
+        profile_id: &str,
+    ) -> Result<PathBuf, String> {
         validate_identifier(profile_id)?;
-        Ok(std::env::temp_dir()
-            .join("yaat-codex-interop")
+        Ok(data_root
+            .join("profiles")
             .join(platform.as_str())
-            .join(profile_id))
+            .join(profile_id)
+            .join("home"))
+    }
+
+    pub fn codex_catalog_path_at(data_root: &Path, profile_id: &str) -> Result<PathBuf, String> {
+        validate_identifier(profile_id)?;
+        Ok(data_root
+            .join("catalogs")
+            .join("codex")
+            .join(format!("{profile_id}.json")))
     }
 
     pub fn ensure_private_directory(path: &Path) -> Result<(), std::io::Error> {
         std::fs::create_dir_all(path)?;
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
+    }
+
+    pub fn ensure_private_file(path: &Path) -> Result<(), std::io::Error> {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
     }
 
     pub fn validate_identifier(value: &str) -> Result<(), String> {
@@ -145,8 +163,7 @@ mod platform {
 
     #[derive(Clone, Debug)]
     pub struct AdapterContext {
-        pub app_data_dir: PathBuf,
-        pub helper_executable: PathBuf,
+        pub data_root: PathBuf,
         pub explicit_cli_path: Option<PathBuf>,
         pub explicit_config_root: Option<PathBuf>,
     }
@@ -154,7 +171,7 @@ mod platform {
     #[derive(Clone, Debug)]
     pub struct ProfileRuntime<'a> {
         pub profile: &'a ProviderProfile,
-        pub secret_ref: Option<&'a str>,
+        pub secret: Option<&'a str>,
     }
 
     #[derive(Clone, Debug, Default)]
@@ -175,6 +192,12 @@ mod platform {
         pub path: PathBuf,
         pub format: activation::ConfigFormat,
         pub operations: Vec<activation::PatchOperation>,
+        pub sidecars: Vec<SidecarPlan>,
+    }
+
+    pub struct SidecarPlan {
+        pub path: PathBuf,
+        pub contents: Option<Vec<u8>>,
     }
 
     pub trait PlatformAdapter: Send + Sync {
@@ -269,7 +292,6 @@ enabled = false
 "#;
     fs::write(config_root.join("config.toml"), source).unwrap();
 
-    let helper = create_helper(temp.path());
     let (base_url, received) = start_mock_responses_server();
     let profile = ProviderProfile {
         id: "docker-profile".into(),
@@ -279,6 +301,12 @@ enabled = false
         account_label: None,
         base_url: Some(base_url),
         model: Some("docker-test-model".into()),
+        custom_headers: Vec::new(),
+        user_agent: None,
+        platform_config: yaat_contracts::ProviderPlatformConfig::Codex {
+            default_model: Some("docker-test-model".into()),
+            catalog: Vec::new(),
+        },
         secret_kind: SecretKind::ApiKey,
         has_secret: true,
         profile_home: None,
@@ -287,41 +315,34 @@ enabled = false
         updated_at: 0,
     };
     let context = AdapterContext {
-        app_data_dir: temp.path().join("yaat-data"),
-        helper_executable: helper,
+        data_root: temp.path().join("yaat-data"),
         explicit_cli_path: Some(codex.clone()),
         explicit_config_root: Some(config_root.clone()),
     };
-    let helper_probe = Command::new(&context.helper_executable)
-        .args(["--yaat-credential-helper", "codex", &profile.id])
-        .output()
-        .unwrap();
-    assert!(helper_probe.status.success());
-    assert_eq!(
-        String::from_utf8(helper_probe.stdout).unwrap().trim(),
-        INTEGRATION_TOKEN
-    );
     let plan = CodexAdapter
         .global_config_plan(
             &context,
             ProfileRuntime {
                 profile: &profile,
-                secret_ref: Some(&profile.id),
+                secret: Some(INTEGRATION_TOKEN),
             },
         )
         .unwrap();
+    assert_eq!(plan.sidecars.len(), 1);
+    assert!(plan.sidecars[0].contents.is_none());
     PatchEngine::apply_file(&plan.path, plan.format, plan.operations).unwrap();
 
     let patched = fs::read_to_string(config_root.join("config.toml")).unwrap();
     assert!(patched.contains("# must survive YAAT activation"));
     assert!(patched.contains("hide_agent_reasoning = true"));
     assert!(patched.contains("[mcp_servers.user_owned]"));
-    assert!(!patched.contains(INTEGRATION_TOKEN));
+    assert!(patched.contains(INTEGRATION_TOKEN));
     let parsed = patched.parse::<DocumentMut>().unwrap();
     assert_eq!(
-        parsed["model_providers"]["yaat_managed_v1"]["auth"]["command"].as_str(),
-        context.helper_executable.to_str()
+        parsed["model_providers"]["custom"]["experimental_bearer_token"].as_str(),
+        Some(INTEGRATION_TOKEN)
     );
+    assert!(patched.contains("[model_providers.custom]"));
 
     let mut child = Command::new(&codex)
         .args([
@@ -359,19 +380,13 @@ enabled = false
             "Codex made no mock Responses request ({error}); early status: {early_status:?}; stderr: {stderr}"
         )
     });
-    let invocations = fs::read_to_string("/tmp/yaat-helper-invocations").unwrap_or_default();
-    assert_eq!(
-        authorization,
-        format!("Bearer {INTEGRATION_TOKEN}"),
-        "helper invocations: {}",
-        invocations.lines().count()
-    );
-    eprintln!("Codex accepted YAAT strict config and invoked the credential helper");
+    assert_eq!(authorization, format!("Bearer {INTEGRATION_TOKEN}"));
+    eprintln!("Codex accepted YAAT strict config and direct provider credential");
 
-    verify_official_credential_switch(&codex, temp.path(), &context.helper_executable);
+    verify_official_credential_switch(&codex, temp.path());
 }
 
-fn verify_official_credential_switch(codex: &Path, directory: &Path, helper: &Path) {
+fn verify_official_credential_switch(codex: &Path, directory: &Path) {
     let adapter = CodexAdapter::new();
     let active_root = directory.join("official-active");
     let account_b_root = directory.join("official-account-b");
@@ -417,8 +432,7 @@ enabled = false
     fs::write(account_b_root.join("auth.json"), &account_b).unwrap();
 
     let context = AdapterContext {
-        app_data_dir: directory.join("yaat-data"),
-        helper_executable: helper.to_owned(),
+        data_root: directory.join("yaat-data"),
         explicit_cli_path: Some(codex.to_owned()),
         explicit_config_root: Some(active_root.clone()),
     };
@@ -447,6 +461,9 @@ enabled = false
         account_label: account_b_snapshot.account_label.clone(),
         base_url: None,
         model: None,
+        custom_headers: Vec::new(),
+        user_agent: None,
+        platform_config: yaat_contracts::ProviderPlatformConfig::empty_for(Platform::Codex),
         secret_kind: SecretKind::None,
         has_secret: false,
         profile_home: None,
@@ -459,7 +476,7 @@ enabled = false
             &context,
             ProfileRuntime {
                 profile: &profile,
-                secret_ref: None,
+                secret: None,
             },
         )
         .unwrap();
@@ -471,11 +488,11 @@ enabled = false
     assert!(patched.contains("[model_providers.user_owned]"));
     assert!(patched.contains("[mcp_servers.user_owned]"));
     let parsed = patched.parse::<DocumentMut>().unwrap();
-    assert_eq!(parsed["model_provider"].as_str(), Some("yaat_managed_v1"));
+    assert_eq!(parsed["model_provider"].as_str(), Some("custom"));
     assert_eq!(parsed["cli_auth_credentials_store"].as_str(), Some("file"));
     assert!(parsed.get("model").is_none());
     assert_eq!(
-        parsed["model_providers"]["yaat_managed_v1"]["requires_openai_auth"].as_bool(),
+        parsed["model_providers"]["custom"]["requires_openai_auth"].as_bool(),
         Some(true)
     );
 
@@ -593,19 +610,6 @@ fn assert_codex_recognizes_chatgpt_login(codex: &Path, config_root: &Path) {
         stdout.contains("Logged in using ChatGPT") || stderr.contains("Logged in using ChatGPT"),
         "unexpected codex login status output; stdout: {stdout}; stderr: {stderr}"
     );
-}
-
-fn create_helper(directory: &Path) -> PathBuf {
-    let path = directory.join("yaat-credential-helper");
-    fs::write(
-        &path,
-        format!(
-            "#!/bin/sh\nprintf 'called\\n' >> /tmp/yaat-helper-invocations\nprintf '%s\\n' '{INTEGRATION_TOKEN}'\n"
-        ),
-    )
-    .unwrap();
-    fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
-    path
 }
 
 fn start_mock_responses_server() -> (String, mpsc::Receiver<String>) {

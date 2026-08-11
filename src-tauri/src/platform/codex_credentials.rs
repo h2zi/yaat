@@ -1204,8 +1204,7 @@ mod tests {
 
     fn context(temp: &TempDir) -> AdapterContext {
         AdapterContext {
-            app_data_dir: temp.path().join("app"),
-            helper_executable: temp.path().join("yaat"),
+            data_root: temp.path().join("data"),
             explicit_cli_path: None,
             explicit_config_root: None,
         }

@@ -1,6 +1,5 @@
 // Claude Code configuration, launch, and secure-storage integration.
 
-use std::borrow::Cow;
 use std::collections::BTreeMap;
 #[cfg(windows)]
 use std::collections::HashMap;
@@ -20,7 +19,7 @@ use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
 #[cfg(any(target_os = "macos", windows, test))]
 use unicode_normalization::UnicodeNormalization;
-use yaat_contracts::{Platform, ProviderKind, SecretKind};
+use yaat_contracts::{Platform, ProviderKind, ProviderPlatformConfig, SecretKind};
 use zeroize::{Zeroize, Zeroizing};
 
 use crate::activation::{
@@ -66,6 +65,12 @@ const OWNED_SETTINGS_PATHS: &[&str] = &[
     "/env/ANTHROPIC_AUTH_TOKEN",
     "/env/ANTHROPIC_BASE_URL",
     "/env/ANTHROPIC_MODEL",
+    "/env/ANTHROPIC_DEFAULT_SONNET_MODEL",
+    "/env/ANTHROPIC_DEFAULT_OPUS_MODEL",
+    "/env/ANTHROPIC_DEFAULT_HAIKU_MODEL",
+    "/env/ANTHROPIC_DEFAULT_FABLE_MODEL",
+    "/env/CLAUDE_CODE_SUBAGENT_MODEL",
+    "/env/ANTHROPIC_CUSTOM_HEADERS",
     "/env/CLAUDE_CODE_OAUTH_TOKEN",
     "/env/CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR",
     "/env/CLAUDE_CODE_USE_BEDROCK",
@@ -80,6 +85,12 @@ const OWNED_ENV_KEYS: &[&str] = &[
     "ANTHROPIC_AUTH_TOKEN",
     "ANTHROPIC_BASE_URL",
     "ANTHROPIC_MODEL",
+    "ANTHROPIC_DEFAULT_SONNET_MODEL",
+    "ANTHROPIC_DEFAULT_OPUS_MODEL",
+    "ANTHROPIC_DEFAULT_HAIKU_MODEL",
+    "ANTHROPIC_DEFAULT_FABLE_MODEL",
+    "CLAUDE_CODE_SUBAGENT_MODEL",
+    "ANTHROPIC_CUSTOM_HEADERS",
     "CLAUDE_CODE_OAUTH_TOKEN",
     "CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR",
     "CLAUDE_CODE_USE_BEDROCK",
@@ -124,11 +135,18 @@ const COMPETING_PROVIDER_ENV: &[&str] = &[
 #[derive(Clone, Copy, Debug, Default)]
 pub struct ClaudeAdapter;
 
-#[derive(Debug)]
+#[derive(Debug, Default)]
 struct DesiredSettings {
-    api_key_helper: Option<String>,
+    api_key: Option<String>,
+    auth_token: Option<String>,
     base_url: Option<String>,
     model: Option<String>,
+    sonnet: Option<String>,
+    opus: Option<String>,
+    haiku: Option<String>,
+    fable: Option<String>,
+    subagent: Option<String>,
+    custom_headers: Option<String>,
 }
 
 impl ClaudeAdapter {
@@ -152,14 +170,14 @@ impl ClaudeAdapter {
 
     fn desired_settings(
         &self,
-        context: &AdapterContext,
+        _context: &AdapterContext,
         runtime: ProfileRuntime<'_>,
     ) -> Result<DesiredSettings, String> {
         ensure_claude_profile(runtime.profile)?;
 
         match runtime.profile.kind {
             ProviderKind::OfficialSubscription => {
-                if runtime.secret_ref.is_some()
+                if runtime.secret.is_some()
                     || runtime.profile.secret_kind != SecretKind::None
                     || runtime.profile.has_secret
                 {
@@ -172,24 +190,28 @@ impl ClaudeAdapter {
                     return Err("Claude subscription profiles cannot override the API URL".into());
                 }
                 Ok(DesiredSettings {
-                    api_key_helper: None,
+                    api_key: None,
+                    auth_token: None,
                     base_url: None,
                     model: runtime.profile.model.clone(),
+                    sonnet: None,
+                    opus: None,
+                    haiku: None,
+                    fable: None,
+                    subagent: None,
+                    custom_headers: None,
                 })
             }
             ProviderKind::OfficialApi | ProviderKind::ThirdParty => {
-                if runtime.profile.secret_kind != SecretKind::ApiKey {
-                    return Err(
-                        "Claude managed API profiles require an API key; bearer-token gateways cannot be injected without exposing plaintext"
-                            .into(),
-                    );
+                if !matches!(
+                    runtime.profile.secret_kind,
+                    SecretKind::ApiKey | SecretKind::BearerToken
+                ) {
+                    return Err("Claude API profiles require an API key or bearer token".into());
                 }
-                let secret_ref = runtime.secret_ref.ok_or_else(|| {
-                    "Claude API profile has no credential reference in the local database"
-                        .to_string()
+                let secret = runtime.secret.ok_or_else(|| {
+                    "Claude API profile has no credential in the local database".to_string()
                 })?;
-                validate_credential_reference(secret_ref)?;
-                let helper = credential_helper_command(&context.helper_executable, secret_ref)?;
 
                 let (base_url, model) = match runtime.profile.kind {
                     ProviderKind::OfficialApi => {
@@ -218,10 +240,44 @@ impl ClaudeAdapter {
                     ProviderKind::OfficialSubscription => unreachable!(),
                 };
 
+                let (default_model, sonnet, opus, haiku, fable, subagent) = match &runtime
+                    .profile
+                    .platform_config
+                {
+                    ProviderPlatformConfig::ClaudeCode {
+                        default_model,
+                        sonnet,
+                        opus,
+                        haiku,
+                        fable,
+                        subagent,
+                    } => (
+                        default_model.clone(),
+                        sonnet.clone(),
+                        opus.clone(),
+                        haiku.clone(),
+                        fable.clone(),
+                        subagent.clone(),
+                    ),
+                    _ => return Err("Claude Code profile has mismatched platform config".into()),
+                };
+                let custom_headers = serialize_custom_headers(
+                    &runtime.profile.custom_headers,
+                    runtime.profile.user_agent.as_deref(),
+                );
                 Ok(DesiredSettings {
-                    api_key_helper: Some(helper),
+                    api_key: (runtime.profile.secret_kind == SecretKind::ApiKey)
+                        .then(|| secret.to_owned()),
+                    auth_token: (runtime.profile.secret_kind == SecretKind::BearerToken)
+                        .then(|| secret.to_owned()),
                     base_url,
-                    model,
+                    model: default_model.or(model),
+                    sonnet,
+                    opus,
+                    haiku,
+                    fable,
+                    subagent,
+                    custom_headers,
                 })
             }
         }
@@ -229,18 +285,18 @@ impl ClaudeAdapter {
 
     fn profile_root(
         &self,
-        context: &AdapterContext,
+        _context: &AdapterContext,
         runtime: ProfileRuntime<'_>,
     ) -> Result<PathBuf, String> {
         ensure_claude_profile(runtime.profile)?;
         crate::paths::validate_identifier(&runtime.profile.id)
             .map_err(|error| error.to_string())?;
-        Ok(context
-            .app_data_dir
-            .join("profiles")
-            .join(Platform::ClaudeCode.as_str())
-            .join(&runtime.profile.id)
-            .join("home"))
+        crate::paths::managed_profile_home_at(
+            &_context.data_root,
+            Platform::ClaudeCode,
+            &runtime.profile.id,
+        )
+        .map_err(|error| error.to_string())
     }
 
     fn source_config_root(&self, context: &AdapterContext) -> Result<PathBuf, String> {
@@ -454,9 +510,17 @@ impl PlatformAdapter for ClaudeAdapter {
         for pointer in OWNED_SETTINGS_PATHS {
             let path = OwnedPath::from_json_pointer(pointer).map_err(|error| error.to_string())?;
             let value = match *pointer {
-                "/apiKeyHelper" => desired.api_key_helper.as_ref(),
+                "/apiKeyHelper" => None,
+                "/env/ANTHROPIC_API_KEY" => desired.api_key.as_ref(),
+                "/env/ANTHROPIC_AUTH_TOKEN" => desired.auth_token.as_ref(),
                 "/env/ANTHROPIC_BASE_URL" => desired.base_url.as_ref(),
                 "/env/ANTHROPIC_MODEL" => desired.model.as_ref(),
+                "/env/ANTHROPIC_DEFAULT_SONNET_MODEL" => desired.sonnet.as_ref(),
+                "/env/ANTHROPIC_DEFAULT_OPUS_MODEL" => desired.opus.as_ref(),
+                "/env/ANTHROPIC_DEFAULT_HAIKU_MODEL" => desired.haiku.as_ref(),
+                "/env/ANTHROPIC_DEFAULT_FABLE_MODEL" => desired.fable.as_ref(),
+                "/env/CLAUDE_CODE_SUBAGENT_MODEL" => desired.subagent.as_ref(),
+                "/env/ANTHROPIC_CUSTOM_HEADERS" => desired.custom_headers.as_ref(),
                 _ => None,
             };
             operations.push(match value {
@@ -469,6 +533,7 @@ impl PlatformAdapter for ClaudeAdapter {
             path: config_root.join(SETTINGS_FILE_NAME),
             format: ConfigFormat::Jsonc,
             operations,
+            sidecars: Vec::new(),
         })
     }
 }
@@ -488,9 +553,22 @@ fn patch_managed_settings(raw: &str, desired: &DesiredSettings) -> Result<String
         "managed Claude settings are malformed: the root value must be an object".to_string()
     })?;
 
-    patch_string_property(&object, "apiKeyHelper", desired.api_key_helper.as_deref());
+    patch_string_property(&object, "apiKeyHelper", None);
 
-    let needs_env = desired.base_url.is_some() || desired.model.is_some();
+    let needs_env = [
+        desired.api_key.as_ref(),
+        desired.auth_token.as_ref(),
+        desired.base_url.as_ref(),
+        desired.model.as_ref(),
+        desired.sonnet.as_ref(),
+        desired.opus.as_ref(),
+        desired.haiku.as_ref(),
+        desired.fable.as_ref(),
+        desired.subagent.as_ref(),
+        desired.custom_headers.as_ref(),
+    ]
+    .into_iter()
+    .any(|value| value.is_some());
     let env = match object.get("env") {
         Some(prop) => Some(prop.object_value().ok_or_else(|| {
             "managed Claude settings are malformed: `env` must be an object".to_string()
@@ -508,6 +586,14 @@ fn patch_managed_settings(raw: &str, desired: &DesiredSettings) -> Result<String
             let desired_value = match *key {
                 "ANTHROPIC_BASE_URL" => desired.base_url.as_deref(),
                 "ANTHROPIC_MODEL" => desired.model.as_deref(),
+                "ANTHROPIC_API_KEY" => desired.api_key.as_deref(),
+                "ANTHROPIC_AUTH_TOKEN" => desired.auth_token.as_deref(),
+                "ANTHROPIC_DEFAULT_SONNET_MODEL" => desired.sonnet.as_deref(),
+                "ANTHROPIC_DEFAULT_OPUS_MODEL" => desired.opus.as_deref(),
+                "ANTHROPIC_DEFAULT_HAIKU_MODEL" => desired.haiku.as_deref(),
+                "ANTHROPIC_DEFAULT_FABLE_MODEL" => desired.fable.as_deref(),
+                "CLAUDE_CODE_SUBAGENT_MODEL" => desired.subagent.as_deref(),
+                "ANTHROPIC_CUSTOM_HEADERS" => desired.custom_headers.as_deref(),
                 _ => None,
             };
             patch_string_property(&env, key, desired_value);
@@ -532,30 +618,18 @@ fn patch_string_property(object: &CstObject, key: &str, value: Option<&str>) {
     }
 }
 
-fn credential_helper_command(helper: &Path, secret_ref: &str) -> Result<String, String> {
-    if !helper.is_absolute() {
-        return Err("credential helper executable must use an absolute path".into());
+fn serialize_custom_headers(
+    headers: &[yaat_contracts::HeaderEntry],
+    user_agent: Option<&str>,
+) -> Option<String> {
+    let mut lines = headers
+        .iter()
+        .map(|entry| format!("{}: {}", entry.name, entry.value))
+        .collect::<Vec<_>>();
+    if let Some(value) = user_agent.filter(|value| !value.trim().is_empty()) {
+        lines.push(format!("User-Agent: {}", value.trim()));
     }
-    let helper = helper
-        .to_str()
-        .ok_or_else(|| "credential helper path is not valid UTF-8".to_string())?;
-    let args = [
-        helper,
-        "--yaat-credential-helper",
-        Platform::ClaudeCode.as_str(),
-        secret_ref,
-    ];
-    Ok(args
-        .into_iter()
-        .map(|value| shell_escape::escape(Cow::Borrowed(value)).into_owned())
-        .collect::<Vec<_>>()
-        .join(" "))
-}
-
-fn validate_credential_reference(value: &str) -> Result<(), String> {
-    crate::paths::validate_identifier(value).map_err(|_| {
-        "credential reference must contain only ASCII letters, digits, '-' or '_'".to_string()
-    })
+    (!lines.is_empty()).then(|| lines.join("\n"))
 }
 
 fn managed_command_spec(
@@ -2059,6 +2133,9 @@ mod tests {
             account_label: None,
             base_url: None,
             model: None,
+            custom_headers: Vec::new(),
+            user_agent: None,
+            platform_config: ProviderPlatformConfig::empty_for(Platform::ClaudeCode),
             secret_kind: if kind == ProviderKind::OfficialSubscription {
                 SecretKind::None
             } else {
@@ -2074,8 +2151,7 @@ mod tests {
 
     fn credential_context(temp: &tempfile::TempDir) -> AdapterContext {
         AdapterContext {
-            app_data_dir: temp.path().join("data"),
-            helper_executable: temp.path().join("yaat"),
+            data_root: temp.path().join("data"),
             explicit_cli_path: None,
             explicit_config_root: Some(temp.path().to_path_buf()),
         }
@@ -2105,11 +2181,10 @@ mod tests {
 }
 "#;
         let desired = DesiredSettings {
-            api_key_helper: Some(
-                "/Applications/YAAT --yaat-credential-helper claude_code ref-1".into(),
-            ),
+            api_key: Some("direct-api-key".into()),
             base_url: Some("https://messages.example.com".into()),
             model: Some("claude-compatible".into()),
+            ..Default::default()
         };
         let patched = patch_managed_settings(raw, &desired).unwrap();
 
@@ -2120,7 +2195,8 @@ mod tests {
         assert!(!patched.contains("must-be-removed"));
         assert!(patched.contains("https://messages.example.com"));
         assert!(patched.contains("claude-compatible"));
-        assert!(patched.contains("apiKeyHelper"));
+        assert!(!patched.contains("apiKeyHelper"));
+        assert!(patched.contains("direct-api-key"));
     }
 
     #[test]
@@ -2142,8 +2218,7 @@ mod tests {
         fs::write(root.join(SETTINGS_FILE_NAME), source).unwrap();
         let profile = profile(ProviderKind::OfficialSubscription);
         let context = AdapterContext {
-            app_data_dir: temp.path().join("data"),
-            helper_executable: temp.path().join("yaat"),
+            data_root: temp.path().join("data"),
             explicit_cli_path: None,
             explicit_config_root: Some(root.clone()),
         };
@@ -2153,7 +2228,7 @@ mod tests {
                 &context,
                 ProfileRuntime {
                     profile: &profile,
-                    secret_ref: None,
+                    secret: None,
                 },
             )
             .unwrap();
@@ -2182,9 +2257,9 @@ mod tests {
         let patched = patch_managed_settings(
             raw,
             &DesiredSettings {
-                api_key_helper: None,
                 base_url: None,
                 model: None,
+                ..Default::default()
             },
         )
         .unwrap();
@@ -2201,27 +2276,12 @@ mod tests {
         let result = patch_managed_settings(
             r#"{"env":"do not destroy me","permissions":{"allow":[]}}"#,
             &DesiredSettings {
-                api_key_helper: None,
                 base_url: Some("https://example.com".into()),
                 model: Some("model".into()),
+                ..Default::default()
             },
         );
         assert!(result.unwrap_err().contains("`env` must be an object"));
-    }
-
-    #[test]
-    fn helper_protocol_is_quoted_and_contains_only_a_reference() {
-        #[cfg(windows)]
-        let executable = Path::new(r"C:\Program Files\Yet Another Account Tool\yaat.exe");
-        #[cfg(not(windows))]
-        let executable = Path::new("/Applications/Yet Another Account Tool/yaat");
-
-        let command = credential_helper_command(executable, "credential-ref_1").unwrap();
-        assert!(command.contains("--yaat-credential-helper claude_code credential-ref_1"));
-        #[cfg(windows)]
-        assert!(command.starts_with('"'));
-        #[cfg(not(windows))]
-        assert!(command.starts_with('\''));
     }
 
     #[test]
@@ -2729,10 +2789,8 @@ mod tests {
         )
         .unwrap();
         fs::write(source.join(".credentials.json"), b"never copy this").unwrap();
-        let helper = temp.path().join("yaat helper");
         let context = AdapterContext {
-            app_data_dir: temp.path().join("data"),
-            helper_executable: helper,
+            data_root: temp.path().join("data"),
             explicit_cli_path: None,
             explicit_config_root: Some(source),
         };
@@ -2742,7 +2800,7 @@ mod tests {
                 &context,
                 ProfileRuntime {
                     profile: &profile,
-                    secret_ref: None,
+                    secret: None,
                 },
             )
             .unwrap();
@@ -2758,8 +2816,7 @@ mod tests {
     fn third_party_requires_its_own_api_key_reference() {
         let temp = tempfile::tempdir().unwrap();
         let context = AdapterContext {
-            app_data_dir: temp.path().join("data"),
-            helper_executable: temp.path().join("yaat"),
+            data_root: temp.path().join("data"),
             explicit_cli_path: None,
             explicit_config_root: Some(temp.path().join("source")),
         };
@@ -2772,10 +2829,10 @@ mod tests {
                 &context,
                 ProfileRuntime {
                     profile: &profile,
-                    secret_ref: None,
+                    secret: None,
                 },
             )
             .unwrap_err();
-        assert!(error.contains("no credential reference"));
+        assert!(error.contains("no credential"));
     }
 }

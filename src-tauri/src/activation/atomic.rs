@@ -28,6 +28,12 @@ impl FileFingerprint {
         &self.0
     }
 
+    pub fn from_hex(value: &str) -> Option<Self> {
+        let bytes = hex::decode(value).ok()?;
+        let digest: [u8; 32] = bytes.try_into().ok()?;
+        Some(Self(digest))
+    }
+
     /// Encodes the fingerprint as lowercase hexadecimal.
     #[must_use]
     pub fn to_hex(self) -> String {

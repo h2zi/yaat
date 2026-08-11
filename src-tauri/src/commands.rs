@@ -5,8 +5,10 @@
 //! single-profile reveal command.
 
 use std::collections::HashMap;
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use chrono_tz::Tz;
@@ -17,21 +19,22 @@ use yaat_contracts::{
     ActivateProviderRequest, ActivationMode, ApiError, AppSettings, BootstrapResponse,
     CaptureCredentialsRequest, CreateProviderRequest, DeactivateGlobalRequest,
     DeleteProviderRequest, HistoryApplyRequest, HistoryApplyResult, HistoryPreview,
-    HistoryPreviewRequest, HistoryScope, ImportCurrentRequest, LaunchRequest, LoginRequest,
-    OperationProgress, OperationResult, Platform, PlatformState, ProfileStatus,
-    ProviderCredentialRequest, ProviderCredentialResponse, ProviderKind, ProviderProfile,
-    ReleaseUpdate, SecretKind, UpdateProgress, UpdateProviderRequest, UsageQueryRequest,
-    UsageReport, UsageRescanRequest,
+    HistoryPreviewRequest, HistoryScope, HistorySyncState, HistorySyncStatus, ImportCurrentRequest,
+    LaunchRequest, LoginRequest, ModelFetchRequest, ModelFetchResponse, OperationProgress,
+    OperationResult, Platform, PlatformState, ProfileStatus, ProviderCredentialRequest,
+    ProviderCredentialResponse, ProviderKind, ProviderProfile, ReleaseUpdate, SecretKind,
+    UpdateProgress, UpdateProviderRequest, UsageQueryRequest, UsageReport, UsageRescanRequest,
 };
 use zeroize::{Zeroize, Zeroizing};
 
 use crate::activation::{
-    ConfigFormat, OwnedPath, PatchEngine, PathChange, PathState, PreparedPatch, RollbackOutcome,
+    ConfigFormat, OwnedPath, PatchEngine, PatchOperation, PathChange, PathState, PreparedPatch,
+    RollbackOutcome, remove_atomically, replace_atomically,
 };
 use crate::app_state::AppState;
 use crate::db::SensitiveRecordKey;
 use crate::error::{AppError, AppResult};
-use crate::platform::{CredentialSnapshot, CredentialState, ProfileRuntime};
+use crate::platform::{CredentialSnapshot, CredentialState, ProfileRuntime, SidecarPlan};
 use crate::usage::service;
 use crate::{history, launcher, paths, process, updates, validation};
 
@@ -39,6 +42,7 @@ const AUTH_SNAPSHOT_KIND: &str = "provider.auth_snapshot.v1";
 const GLOBAL_BASELINE_KIND: &str = "global.baseline.v1";
 const OFFICIAL_CREDENTIAL_EXPORT_FORMAT: &str = "yaat.official-credential";
 const OFFICIAL_CREDENTIAL_EXPORT_VERSION: u32 = 1;
+const MAX_SIDECAR_BYTES: u64 = 16 * 1024 * 1024;
 
 #[derive(Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -290,6 +294,15 @@ pub fn provider_credential_get(
 }
 
 #[tauri::command]
+pub async fn provider_models_fetch(
+    request: ModelFetchRequest,
+) -> Result<ModelFetchResponse, ApiError> {
+    api(crate::model_fetch::fetch(&request)
+        .await
+        .map_err(AppError::Command))
+}
+
+#[tauri::command]
 pub fn provider_delete(
     state: State<'_, AppState>,
     request: DeleteProviderRequest,
@@ -353,7 +366,7 @@ pub fn provider_login(
                 &context,
                 ProfileRuntime {
                     profile: &profile,
-                    secret_ref: profile.has_secret.then_some(profile.id.as_str()),
+                    secret: None,
                 },
                 request.console,
             )
@@ -416,10 +429,12 @@ pub fn profile_launch(
         state.validate_profile_for_platform(&profile)?;
         let cwd = validate_launch_cwd(profile.platform, request.cwd.as_deref())?;
         let settings = state.repository.load_settings().map_err(AppError::from)?;
-        let mut warning = sync_history_for_launch(&state, &profile, &settings)
-            .err()
-            .map(|error| format!("history sync failed and can be retried from Settings: {error}"));
+        let mut warning = None;
         let context = state.context(profile.platform, &settings);
+        let stored_secret = state
+            .repository
+            .load_provider_secret(&profile.id)
+            .map_err(AppError::from)?;
         if profile.platform == Platform::ClaudeDesktop {
             process::ensure_claude_desktop_is_stopped()?;
         }
@@ -429,7 +444,9 @@ pub fn profile_launch(
                 &context,
                 ProfileRuntime {
                     profile: &profile,
-                    secret_ref: profile.has_secret.then_some(profile.id.as_str()),
+                    secret: stored_secret
+                        .as_ref()
+                        .map(secrecy::ExposeSecret::expose_secret),
                 },
                 cwd,
                 Vec::new(),
@@ -452,6 +469,7 @@ pub fn profile_launch(
                 None => binding_warning,
             });
         }
+        schedule_history_sync(&state, profile.platform, true);
         Ok(operation("managed profile launched", warning))
     })())
 }
@@ -462,16 +480,6 @@ pub async fn usage_query(
     request: UsageQueryRequest,
     on_progress: Channel<OperationProgress>,
 ) -> Result<UsageReport, ApiError> {
-    let scan_required = state
-        .repository
-        .load_usage_scan_summary(request.platform)
-        .map_err(AppError::from)
-        .map_err(ApiError::from)?
-        .is_none();
-    if !scan_required {
-        return api(service::query(&state.repository, &request));
-    }
-
     let roots = usage_roots(&state, request.platform).map_err(ApiError::from)?;
     let repository = state.repository.clone();
     let cancelled = state.begin_usage_operation();
@@ -498,7 +506,7 @@ pub async fn usage_rescan(
     let repository = state.repository.clone();
     let cancelled = state.begin_usage_operation();
     finish_background(tauri::async_runtime::spawn_blocking(move || {
-        let summary = service::scan_cancellable(
+        let summary = service::scan_full_cancellable(
             &repository,
             request.platform,
             &roots,
@@ -529,11 +537,53 @@ pub fn settings_update(
     api((|| {
         validate_settings(&request)?;
         let current = state.repository.load_settings().map_err(AppError::from)?;
+        if current.unify_codex_history && !request.unify_codex_history {
+            return Err(AppError::Validation(
+                "Codex unified history cannot be disabled after it is enabled".into(),
+            ));
+        }
         reject_active_root_change(&state, &current, &request)?;
-        state
+        if !current.unify_codex_history && request.unify_codex_history {
+            let normalized = state
+                .repository
+                .list_history_sync_status()
+                .map_err(AppError::from)?
+                .into_iter()
+                .any(|status| {
+                    status.scope == HistoryScope::Codex
+                        && status.state == HistorySyncState::Completed
+                });
+            if !normalized {
+                return Err(AppError::Validation(
+                    "run Codex history unification successfully before enabling it".into(),
+                ));
+            }
+            process::ensure_codex_history_clients_stopped()?;
+            let binding = state
+                .repository
+                .get_platform_binding(Platform::Codex)
+                .map_err(AppError::from)?;
+            let active_kind = binding
+                .global_profile_id
+                .as_deref()
+                .map(|id| require_profile(&state, id))
+                .transpose()?
+                .map(|profile| profile.kind);
+            if active_kind.is_none_or(|kind| kind == ProviderKind::OfficialSubscription) {
+                apply_codex_unified_shell(&state, &request)?;
+            }
+        }
+        let saved = state
             .repository
             .save_settings(&request)
-            .map_err(AppError::from)
+            .map_err(AppError::from)?;
+        if current.unify_claude_code_history && !saved.unify_claude_code_history {
+            state.cancel_queued_history(HistoryScope::ClaudeCode);
+        }
+        if current.unify_claude_desktop_code_history && !saved.unify_claude_desktop_code_history {
+            state.cancel_queued_history(HistoryScope::ClaudeDesktopCode);
+        }
+        Ok(saved)
     })())
 }
 
@@ -565,22 +615,85 @@ pub async fn history_apply(
 ) -> Result<HistoryApplyResult, ApiError> {
     ensure_history_clients_stopped(request.scope).map_err(ApiError::from)?;
     let roots = history_roots(&state, request.scope).map_err(ApiError::from)?;
+    let repository = Arc::clone(&state.repository);
+    let status_repository = Arc::clone(&state.repository);
+    let scope = request.scope;
     let cancelled = state.begin_history_operation();
-    finish_background(tauri::async_runtime::spawn_blocking(move || {
-        history::apply_cancellable(
-            request.scope,
+    let _ = repository.save_history_sync_status(&HistorySyncStatus {
+        scope,
+        state: HistorySyncState::Scanning,
+        ..HistorySyncStatus::default()
+    });
+    let task = tauri::async_runtime::spawn_blocking(move || {
+        let mut send = progress_sender(on_progress);
+        let mut normalizing = false;
+        history::apply_full_indexed_cancellable(
+            &repository,
+            scope,
             roots,
             request.target_group_id.as_deref(),
             &cancelled,
-            progress_sender(on_progress),
+            move |progress| {
+                if scope == HistoryScope::Codex
+                    && progress.phase == yaat_contracts::OperationPhase::Saving
+                    && !normalizing
+                {
+                    let _ = status_repository.save_history_sync_status(&HistorySyncStatus {
+                        scope,
+                        state: HistorySyncState::Normalizing,
+                        processed_files: progress.processed,
+                        ..HistorySyncStatus::default()
+                    });
+                    normalizing = true;
+                }
+                send(progress);
+            },
         )
-    }))
-    .await
+    });
+    let result = match task.await {
+        Ok(result) => result,
+        Err(error) => Err(AppError::Internal(format!(
+            "background task failed: {error}"
+        ))),
+    };
+    let status = match &result {
+        Ok(result) => HistorySyncStatus {
+            scope,
+            state: HistorySyncState::Completed,
+            processed_files: result
+                .copied
+                .saturating_add(result.metadata_updated)
+                .saturating_add(result.identical_files),
+            last_completed_at: Some(chrono::Utc::now().timestamp_millis()),
+            error_summary: None,
+        },
+        Err(AppError::Cancelled) => HistorySyncStatus {
+            scope,
+            state: HistorySyncState::Cancelled,
+            ..HistorySyncStatus::default()
+        },
+        Err(error) => HistorySyncStatus {
+            scope,
+            state: HistorySyncState::Failed,
+            error_summary: Some(truncate_error(&error.to_string())),
+            ..HistorySyncStatus::default()
+        },
+    };
+    let _ = state.repository.save_history_sync_status(&status);
+    api(result)
 }
 
 #[tauri::command]
 pub fn history_cancel(state: State<'_, AppState>) {
     state.cancel_history_operation();
+}
+
+#[tauri::command]
+pub fn history_sync_status(state: State<'_, AppState>) -> Result<Vec<HistorySyncStatus>, ApiError> {
+    api(state
+        .repository
+        .list_history_sync_status()
+        .map_err(AppError::from))
 }
 
 fn activate_global(state: &AppState, profile: &ProviderProfile) -> AppResult<OperationResult> {
@@ -594,14 +707,31 @@ fn activate_global(state: &AppState, profile: &ProviderProfile) -> AppResult<Ope
         crate::platform::claude::ensure_global_credential_namespace()
             .map_err(AppError::Credential)?;
     }
+    let stored_secret = state
+        .repository
+        .load_provider_secret(&profile.id)
+        .map_err(AppError::from)?;
     let runtime = ProfileRuntime {
         profile,
-        secret_ref: profile.has_secret.then_some(profile.id.as_str()),
+        secret: stored_secret
+            .as_ref()
+            .map(secrecy::ExposeSecret::expose_secret),
     };
-    let plan = state
+    let mut plan = state
         .adapter(profile.platform)
-        .global_config_plan(&context, runtime)
+        .global_config_plan(&context, runtime.clone())
         .map_err(AppError::ConfigMalformed)?;
+    if profile.platform == Platform::Codex
+        && profile.kind == ProviderKind::OfficialSubscription
+        && !settings.unify_codex_history
+    {
+        plan.operations = loaded_baseline
+            .as_ref()
+            .map(baseline_restore_operations)
+            .transpose()?
+            .unwrap_or_default();
+    }
+    let mut sidecars = prepare_sidecars(plan.sidecars)?;
     let prepared =
         PatchEngine::prepare_file(&plan.path, plan.format, plan.operations).map_err(patch_error)?;
     let config_path = path_text(prepared.path())?.to_owned();
@@ -615,8 +745,13 @@ fn activate_global(state: &AppState, profile: &ProviderProfile) -> AppResult<Ope
         Some(load_snapshot(state, &profile.id)?)
     } else if profile.platform == Platform::ClaudeDesktop {
         Some(
-            crate::platform::claude_desktop::global_credential_for_profile(profile)
-                .map_err(AppError::Credential)?,
+            crate::platform::claude_desktop::global_credential_for_profile(
+                profile,
+                runtime.secret.ok_or_else(|| {
+                    AppError::Credential("Claude Desktop provider credential is unavailable".into())
+                })?,
+            )
+            .map_err(AppError::Credential)?,
         )
     } else {
         None
@@ -673,9 +808,21 @@ fn activate_global(state: &AppState, profile: &ProviderProfile) -> AppResult<Ope
     }
     store_global_baseline(state, profile.platform, &baseline)?;
 
+    if let Err(error) = commit_sidecars(&mut sidecars) {
+        let baseline_rollback = restore_global_baseline_state(
+            state,
+            profile.platform,
+            previous_baseline.as_ref().map(|value| value.as_slice()),
+        );
+        return Err(AppError::ConfigMalformed(format!(
+            "sidecar update failed: {error}; baseline rollback: {baseline_rollback}"
+        )));
+    }
+
     let applied = match PatchEngine::commit(prepared) {
         Ok(applied) => applied,
         Err(error) => {
+            let sidecar_rollback = rollback_sidecars(&mut sidecars);
             let baseline_rollback = restore_global_baseline_state(
                 state,
                 profile.platform,
@@ -684,10 +831,10 @@ fn activate_global(state: &AppState, profile: &ProviderProfile) -> AppResult<Ope
             let error = patch_error(error);
             return Err(match error {
                 AppError::ConfigConflict(message) => AppError::ConfigConflict(format!(
-                    "{message}; baseline rollback: {baseline_rollback}"
+                    "{message}; sidecar rollback: {sidecar_rollback}; baseline rollback: {baseline_rollback}"
                 )),
                 AppError::ConfigMalformed(message) => AppError::ConfigMalformed(format!(
-                    "{message}; baseline rollback: {baseline_rollback}"
+                    "{message}; sidecar rollback: {sidecar_rollback}; baseline rollback: {baseline_rollback}"
                 )),
                 other => other,
             });
@@ -706,6 +853,7 @@ fn activate_global(state: &AppState, profile: &ProviderProfile) -> AppResult<Ope
             &config_root,
             current_credential.as_ref(),
             &applied,
+            &mut sidecars,
         );
         let baseline_rollback = if rollback.complete {
             restore_global_baseline_state(
@@ -732,6 +880,7 @@ fn activate_global(state: &AppState, profile: &ProviderProfile) -> AppResult<Ope
             &config_root,
             current_credential.as_ref(),
             &applied,
+            &mut sidecars,
         );
         let baseline_rollback = if rollback.complete {
             restore_global_baseline_state(
@@ -748,16 +897,17 @@ fn activate_global(state: &AppState, profile: &ProviderProfile) -> AppResult<Ope
         )));
     }
 
-    let history_warning = sync_history_after_global_switch(state, profile.platform, &settings)
-        .err()
-        .map(|error| format!("history sync failed and can be retried from Settings: {error}"));
-    let warning = merge_warnings(credential_warning, history_warning);
-    Ok(operation("global provider activated", warning))
+    schedule_history_sync(state, profile.platform, false);
+    Ok(operation("global provider activated", credential_warning))
 }
 
 fn deactivate_global(state: &AppState, platform: Platform) -> AppResult<OperationResult> {
     ensure_platform_stopped(platform)?;
     let Some(mut baseline) = load_global_baseline(state, platform)? else {
+        let settings = state.repository.load_settings().map_err(AppError::from)?;
+        if platform == Platform::Codex && settings.unify_codex_history {
+            apply_codex_unified_shell(state, &settings)?;
+        }
         state
             .repository
             .set_global_profile(platform, None)
@@ -817,6 +967,9 @@ fn deactivate_global(state: &AppState, platform: Platform) -> AppResult<Operatio
         }
         return Err(error);
     }
+    if platform == Platform::Codex && settings.unify_codex_history {
+        apply_codex_unified_shell(state, &settings)?;
+    }
     state
         .repository
         .clear_global_profile_and_delete_sensitive_record(
@@ -828,6 +981,41 @@ fn deactivate_global(state: &AppState, platform: Platform) -> AppResult<Operatio
         "global management stopped; original account fields restored",
         warning,
     ))
+}
+
+fn apply_codex_unified_shell(state: &AppState, settings: &AppSettings) -> AppResult<()> {
+    let profile = ProviderProfile {
+        id: "unified-official-shell".into(),
+        platform: Platform::Codex,
+        kind: ProviderKind::OfficialSubscription,
+        name: "OpenAI".into(),
+        secret_kind: SecretKind::None,
+        status: ProfileStatus::Ready,
+        platform_config: yaat_contracts::ProviderPlatformConfig::empty_for(Platform::Codex),
+        ..ProviderProfile::default()
+    };
+    let context = state.context(Platform::Codex, settings);
+    let plan = state
+        .adapter(Platform::Codex)
+        .global_config_plan(
+            &context,
+            ProfileRuntime {
+                profile: &profile,
+                secret: None,
+            },
+        )
+        .map_err(AppError::ConfigMalformed)?;
+    let mut sidecars = prepare_sidecars(plan.sidecars)?;
+    let prepared =
+        PatchEngine::prepare_file(&plan.path, plan.format, plan.operations).map_err(patch_error)?;
+    commit_sidecars(&mut sidecars).map_err(AppError::ConfigMalformed)?;
+    if let Err(error) = PatchEngine::commit(prepared).map_err(patch_error) {
+        let rollback = rollback_sidecars(&mut sidecars);
+        return Err(AppError::ConfigMalformed(format!(
+            "{error}; sidecar rollback: {rollback}"
+        )));
+    }
+    Ok(())
 }
 
 fn merge_baseline_changes(baseline: &mut StoredGlobalBaseline, prepared: &PreparedPatch) {
@@ -846,6 +1034,28 @@ fn merge_baseline_changes(baseline: &mut StoredGlobalBaseline, prepared: &Prepar
             baseline.changes.push(StoredPathChange::from(change));
         }
     }
+}
+
+fn baseline_restore_operations(baseline: &StoredGlobalBaseline) -> AppResult<Vec<PatchOperation>> {
+    baseline
+        .changes
+        .iter()
+        .map(|change| {
+            let path = OwnedPath::from_json_pointer(&change.path)
+                .map_err(|error| AppError::ConfigMalformed(error.to_string()))?;
+            if change.before_exists {
+                let value = change.before.clone().ok_or_else(|| {
+                    AppError::ConfigMalformed(format!(
+                        "global baseline is missing the original value for {}",
+                        change.path
+                    ))
+                })?;
+                Ok(PatchOperation::set(path, value))
+            } else {
+                Ok(PatchOperation::remove(path))
+            }
+        })
+        .collect()
 }
 
 fn validate_baseline(
@@ -885,6 +1095,7 @@ fn rollback_switch(
     config_root: &Path,
     previous_credential: Option<&CredentialState>,
     applied: &crate::activation::AppliedPatch,
+    sidecars: &mut [PreparedSidecar],
 ) -> SwitchRollback {
     let (credential, credential_complete) = previous_credential.map_or_else(
         || ("not changed".to_owned(), true),
@@ -904,9 +1115,148 @@ fn rollback_switch(
         ),
         Err(error) => (error.to_string(), false),
     };
+    let sidecar = rollback_sidecars(sidecars);
+    let sidecar_complete = sidecar == "restored" || sidecar == "not changed";
     SwitchRollback {
-        summary: format!("credential {credential}; config {config}"),
-        complete: credential_complete && config_complete,
+        summary: format!("credential {credential}; config {config}; sidecars {sidecar}"),
+        complete: credential_complete && config_complete && sidecar_complete,
+    }
+}
+
+struct PreparedSidecar {
+    path: PathBuf,
+    before: Option<Vec<u8>>,
+    desired: Option<Vec<u8>>,
+    committed: bool,
+}
+
+fn prepare_sidecars(plans: Vec<SidecarPlan>) -> AppResult<Vec<PreparedSidecar>> {
+    let data_root = paths::app_data_dir()?;
+    let mut seen = std::collections::HashSet::new();
+    plans
+        .into_iter()
+        .map(|plan| {
+            if !plan.path.is_absolute() || !plan.path.starts_with(&data_root) {
+                return Err(AppError::ConfigMalformed(format!(
+                    "sidecar path must stay inside {}",
+                    data_root.display()
+                )));
+            }
+            if !seen.insert(plan.path.clone()) {
+                return Err(AppError::ConfigMalformed(format!(
+                    "duplicate sidecar path: {}",
+                    plan.path.display()
+                )));
+            }
+            if plan
+                .contents
+                .as_ref()
+                .is_some_and(|contents| contents.len() as u64 > MAX_SIDECAR_BYTES)
+            {
+                return Err(AppError::ConfigMalformed(format!(
+                    "sidecar exceeds the {MAX_SIDECAR_BYTES} byte limit: {}",
+                    plan.path.display()
+                )));
+            }
+            let before = read_sidecar(&plan.path)?;
+            Ok(PreparedSidecar {
+                path: plan.path,
+                before,
+                desired: plan.contents,
+                committed: false,
+            })
+        })
+        .collect()
+}
+
+fn read_sidecar(path: &Path) -> AppResult<Option<Vec<u8>>> {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(AppError::Io(error.to_string())),
+    };
+    if !metadata.file_type().is_file() || metadata.file_type().is_symlink() {
+        return Err(AppError::ConfigMalformed(format!(
+            "refusing non-regular sidecar file: {}",
+            path.display()
+        )));
+    }
+    if metadata.len() > MAX_SIDECAR_BYTES {
+        return Err(AppError::ConfigMalformed(format!(
+            "sidecar exceeds the {MAX_SIDECAR_BYTES} byte limit: {}",
+            path.display()
+        )));
+    }
+    fs::read(path).map(Some).map_err(AppError::from)
+}
+
+fn commit_sidecars(sidecars: &mut [PreparedSidecar]) -> Result<(), String> {
+    for index in 0..sidecars.len() {
+        let path = sidecars[index].path.clone();
+        let current = read_sidecar(&path).map_err(|error| error.to_string())?;
+        if current != sidecars[index].before {
+            let rollback = rollback_sidecars(&mut sidecars[..index]);
+            return Err(format!(
+                "{} changed outside YAAT; rollback: {rollback}",
+                path.display()
+            ));
+        }
+        let write_result = {
+            let sidecar = &sidecars[index];
+            write_sidecar(&sidecar.path, sidecar.desired.as_deref())
+        };
+        if let Err(error) = write_result {
+            let rollback = rollback_sidecars(&mut sidecars[..index]);
+            return Err(format!("{error}; rollback: {rollback}"));
+        }
+        sidecars[index].committed = true;
+    }
+    Ok(())
+}
+
+fn write_sidecar(path: &Path, contents: Option<&[u8]>) -> Result<(), String> {
+    match contents {
+        Some(contents) => {
+            let parent = path
+                .parent()
+                .ok_or_else(|| format!("sidecar path has no parent: {}", path.display()))?;
+            paths::ensure_private_directory(parent).map_err(|error| error.to_string())?;
+            replace_atomically(path, contents).map_err(|error| error.to_string())?;
+            paths::ensure_private_file(path).map_err(|error| error.to_string())
+        }
+        None => remove_atomically(path).map_err(|error| error.to_string()),
+    }
+}
+
+fn rollback_sidecars(sidecars: &mut [PreparedSidecar]) -> String {
+    if !sidecars.iter().any(|sidecar| sidecar.committed) {
+        return "not changed".into();
+    }
+    let mut errors = Vec::new();
+    for sidecar in sidecars
+        .iter_mut()
+        .rev()
+        .filter(|sidecar| sidecar.committed)
+    {
+        match read_sidecar(&sidecar.path) {
+            Ok(current) if current == sidecar.desired => {
+                if let Err(error) = write_sidecar(&sidecar.path, sidecar.before.as_deref()) {
+                    errors.push(error);
+                } else {
+                    sidecar.committed = false;
+                }
+            }
+            Ok(_) => errors.push(format!(
+                "{} changed outside YAAT after publication",
+                sidecar.path.display()
+            )),
+            Err(error) => errors.push(error.to_string()),
+        }
+    }
+    if errors.is_empty() {
+        "restored".into()
+    } else {
+        errors.join("; ")
     }
 }
 
@@ -1043,6 +1393,10 @@ fn bootstrap_inner(state: &AppState) -> AppResult<BootstrapResponse> {
         profiles,
         platforms,
         settings,
+        history_sync: state
+            .repository
+            .list_history_sync_status()
+            .map_err(AppError::from)?,
     })
 }
 
@@ -1110,7 +1464,7 @@ fn install_official_credential(
             &context,
             ProfileRuntime {
                 profile,
-                secret_ref: None,
+                secret: None,
             },
         )
         .map_err(AppError::ConfigMalformed)?;
@@ -1133,10 +1487,10 @@ fn validate_platform_profile_shape(
 ) -> AppResult<()> {
     if matches!(platform, Platform::ClaudeCode | Platform::ClaudeDesktop)
         && kind != ProviderKind::OfficialSubscription
-        && secret_kind != SecretKind::ApiKey
+        && !matches!(secret_kind, SecretKind::ApiKey | SecretKind::BearerToken)
     {
         return Err(AppError::Validation(
-            "Claude API profiles require an API key".into(),
+            "Claude API profiles require an API key or bearer token".into(),
         ));
     }
     if platform == Platform::ClaudeDesktop && kind != ProviderKind::OfficialSubscription {
@@ -1203,6 +1557,9 @@ fn import_current_inner(
             .or_else(|| snapshot.account_label.clone()),
         base_url: None,
         model: None,
+        custom_headers: Vec::new(),
+        user_agent: None,
+        platform_config: yaat_contracts::ProviderPlatformConfig::empty_for(request.platform),
         secret_kind: SecretKind::None,
         secret: None,
         official_credential: None,
@@ -1218,7 +1575,7 @@ fn import_current_inner(
                 &context,
                 ProfileRuntime {
                     profile: &profile,
-                    secret_ref: None,
+                    secret: None,
                 },
             )
             .map_err(AppError::ConfigMalformed)?;
@@ -1443,51 +1800,131 @@ fn claude_desktop_history_roots(state: &AppState) -> AppResult<Vec<history::Hist
         .collect()
 }
 
-fn sync_history_for_launch(
-    state: &AppState,
-    profile: &ProviderProfile,
-    settings: &AppSettings,
-) -> AppResult<()> {
-    let enabled = match profile.platform {
+fn schedule_history_sync(state: &AppState, platform: Platform, wait_for_exit: bool) {
+    let scope = history_scope(platform);
+    let settings = match state.repository.load_settings() {
+        Ok(settings) => settings,
+        Err(_) => return,
+    };
+    let enabled = match platform {
         Platform::Codex => settings.unify_codex_history,
         Platform::ClaudeCode => settings.unify_claude_code_history,
         Platform::ClaudeDesktop => settings.unify_claude_desktop_code_history,
     };
     if !enabled {
-        return Ok(());
+        return;
     }
-    ensure_platform_stopped(profile.platform)?;
-    let target = if profile.platform == Platform::ClaudeDesktop {
-        settings.claude_desktop_history_target.as_deref()
-    } else {
-        None
+    let Some(task) = state.begin_queued_history(scope) else {
+        return;
     };
-    history::apply(
-        history_scope(profile.platform),
-        history_roots(state, history_scope(profile.platform))?,
-        target,
-    )?;
-    Ok(())
+    let roots = match history_roots(state, scope) {
+        Ok(roots) => roots,
+        Err(error) => {
+            let _ = state
+                .repository
+                .save_history_sync_status(&HistorySyncStatus {
+                    scope,
+                    state: HistorySyncState::Failed,
+                    error_summary: Some(truncate_error(&error.to_string())),
+                    ..HistorySyncStatus::default()
+                });
+            return;
+        }
+    };
+    let target = (platform == Platform::ClaudeDesktop)
+        .then_some(settings.claude_desktop_history_target)
+        .flatten();
+    let repository = Arc::clone(&state.repository);
+    let cancelled = task.cancelled();
+    let _ = repository.save_history_sync_status(&HistorySyncStatus {
+        scope,
+        state: HistorySyncState::Queued,
+        ..HistorySyncStatus::default()
+    });
+    tauri::async_runtime::spawn_blocking(move || {
+        if wait_for_exit {
+            for _ in 0..120 {
+                if cancelled.load(std::sync::atomic::Ordering::Acquire) {
+                    break;
+                }
+                if ensure_history_clients_stopped(scope).is_ok() {
+                    break;
+                }
+                std::thread::sleep(Duration::from_secs(1));
+            }
+        }
+        let result = if cancelled.load(std::sync::atomic::Ordering::Acquire) {
+            Err(AppError::Cancelled)
+        } else {
+            ensure_history_clients_stopped(scope).and_then(|()| {
+                let current = repository.load_settings().map_err(AppError::from)?;
+                let still_enabled = match scope {
+                    HistoryScope::Codex => current.unify_codex_history,
+                    HistoryScope::ClaudeCode => current.unify_claude_code_history,
+                    HistoryScope::ClaudeDesktopCode => current.unify_claude_desktop_code_history,
+                };
+                if !still_enabled {
+                    return Err(AppError::Cancelled);
+                }
+                let _ = repository.save_history_sync_status(&HistorySyncStatus {
+                    scope,
+                    state: HistorySyncState::Scanning,
+                    ..HistorySyncStatus::default()
+                });
+                let mut normalizing = false;
+                history::apply_incremental_cancellable(
+                    &repository,
+                    scope,
+                    roots,
+                    target.as_deref(),
+                    &cancelled,
+                    |progress| {
+                        if scope == HistoryScope::Codex
+                            && progress.phase == yaat_contracts::OperationPhase::Saving
+                            && !normalizing
+                        {
+                            let _ = repository.save_history_sync_status(&HistorySyncStatus {
+                                scope,
+                                state: HistorySyncState::Normalizing,
+                                processed_files: progress.processed,
+                                ..HistorySyncStatus::default()
+                            });
+                            normalizing = true;
+                        }
+                    },
+                )
+            })
+        };
+        let status = match result {
+            Ok(result) => HistorySyncStatus {
+                scope,
+                state: HistorySyncState::Completed,
+                processed_files: result
+                    .copied
+                    .saturating_add(result.metadata_updated)
+                    .saturating_add(result.identical_files),
+                last_completed_at: Some(chrono::Utc::now().timestamp_millis()),
+                error_summary: None,
+            },
+            Err(AppError::Cancelled) => HistorySyncStatus {
+                scope,
+                state: HistorySyncState::Cancelled,
+                ..HistorySyncStatus::default()
+            },
+            Err(error) => HistorySyncStatus {
+                scope,
+                state: HistorySyncState::Failed,
+                error_summary: Some(truncate_error(&error.to_string())),
+                ..HistorySyncStatus::default()
+            },
+        };
+        let _ = repository.save_history_sync_status(&status);
+        drop(task);
+    });
 }
 
-fn sync_history_after_global_switch(
-    state: &AppState,
-    platform: Platform,
-    settings: &AppSettings,
-) -> AppResult<()> {
-    let enabled = match platform {
-        Platform::Codex => settings.unify_codex_history,
-        Platform::ClaudeCode => settings.unify_claude_code_history,
-        Platform::ClaudeDesktop => false,
-    };
-    if enabled {
-        history::apply(
-            history_scope(platform),
-            history_roots(state, history_scope(platform))?,
-            None,
-        )?;
-    }
-    Ok(())
+fn truncate_error(value: &str) -> String {
+    value.chars().take(512).collect()
 }
 
 fn history_scope(platform: Platform) -> HistoryScope {
@@ -1569,6 +2006,14 @@ fn validate_settings(settings: &AppSettings) -> AppResult<()> {
     }
     Tz::from_str(&settings.timezone)
         .map_err(|_| AppError::Validation("unknown IANA timezone".into()))?;
+    if !matches!(
+        settings.usage_refresh_interval_seconds,
+        0 | 5 | 10 | 30 | 60
+    ) {
+        return Err(AppError::Validation(
+            "usage refresh interval must be off, 5, 10, 30, or 60 seconds".into(),
+        ));
+    }
     if settings.unify_claude_desktop_code_history
         && settings.claude_desktop_history_target.is_none()
     {
@@ -1633,6 +2078,9 @@ fn require_ready_profile(state: &AppState, id: &str) -> AppResult<ProviderProfil
 fn provider_execution_changed(current: &ProviderProfile, request: &UpdateProviderRequest) -> bool {
     current.base_url != request.base_url
         || current.model != request.model
+        || current.custom_headers != request.custom_headers
+        || current.user_agent != request.user_agent
+        || current.platform_config != request.platform_config
         || current.secret_kind != request.secret_kind
         || request.replacement_secret.is_some()
         || request.replacement_official_credential.is_some()
@@ -1675,15 +2123,6 @@ fn operation(message: &str, warning: Option<String>) -> OperationResult {
     OperationResult {
         message: message.into(),
         warning,
-    }
-}
-
-fn merge_warnings(first: Option<String>, second: Option<String>) -> Option<String> {
-    match (first, second) {
-        (Some(first), Some(second)) if first == second => Some(first),
-        (Some(first), Some(second)) => Some(format!("{first}\n{second}")),
-        (Some(warning), None) | (None, Some(warning)) => Some(warning),
-        (None, None) => None,
     }
 }
 
@@ -1770,6 +2209,9 @@ mod tests {
             account_label: Some("New label".into()),
             base_url: current.base_url.clone(),
             model: current.model.clone(),
+            custom_headers: current.custom_headers.clone(),
+            user_agent: current.user_agent.clone(),
+            platform_config: current.platform_config.clone(),
             secret_kind: current.secret_kind,
             replacement_secret: None,
             replacement_official_credential: None,

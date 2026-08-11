@@ -1,7 +1,7 @@
 #!/bin/sh
 set -eu
 
-image="yaat-codex-integration:0.146.0"
+image="yaat-codex-integration:0.147.0"
 
 docker build \
   --file docker/codex-integration.Dockerfile \

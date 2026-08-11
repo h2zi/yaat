@@ -9,6 +9,7 @@ fn main() {
         "provider_create",
         "provider_update",
         "provider_credential_get",
+        "provider_models_fetch",
         "provider_delete",
         "provider_activate",
         "provider_global_deactivate",
@@ -23,6 +24,7 @@ fn main() {
         "history_preview",
         "history_apply",
         "history_cancel",
+        "history_sync_status",
     ];
 
     let attributes = tauri_build::Attributes::new()

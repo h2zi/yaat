@@ -1,10 +1,12 @@
 //! Shared application state and platform-adapter selection.
 
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use yaat_contracts::{AppSettings, Platform, ProviderProfile};
+use yaat_contracts::{AppSettings, HistoryScope, Platform, ProviderProfile};
 
 use crate::db::Repository;
 use crate::error::{AppError, AppResult};
@@ -17,31 +19,37 @@ use crate::{paths, validation};
 
 pub struct AppState {
     pub repository: Arc<Repository>,
-    pub app_data_dir: PathBuf,
-    pub helper_executable: PathBuf,
     usage_cancelled: Arc<AtomicBool>,
     history_cancelled: Arc<AtomicBool>,
+    history_running: Arc<Mutex<HashSet<HistoryScope>>>,
+    history_background_tokens: Arc<Mutex<HashMap<HistoryScope, Arc<AtomicBool>>>>,
     codex: CodexAdapter,
     claude: ClaudeAdapter,
     claude_desktop: ClaudeDesktopAdapter,
 }
 
 impl AppState {
-    pub fn open(helper_executable: PathBuf) -> AppResult<Self> {
-        if !helper_executable.is_absolute() {
-            return Err(AppError::Internal(
-                "YAAT executable path is not absolute".into(),
-            ));
-        }
+    pub fn open() -> AppResult<Self> {
         let app_data_dir = paths::app_data_dir()?;
         paths::ensure_private_directory(&app_data_dir)?;
-        let repository = Repository::open(paths::database_path()?).map_err(AppError::from)?;
+        for child in ["profiles", "catalogs"] {
+            paths::ensure_private_directory(&app_data_dir.join(child))?;
+        }
+        paths::ensure_private_directory(&paths::backups_dir()?)?;
+        let database_path = paths::database_path()?;
+        let repository = Repository::open(&database_path).map_err(AppError::from)?;
+        paths::ensure_private_file(&database_path)?;
+        for auxiliary in paths::database_auxiliary_paths(&database_path) {
+            if auxiliary.exists() {
+                paths::ensure_private_file(&auxiliary)?;
+            }
+        }
         Ok(Self {
             repository: Arc::new(repository),
-            app_data_dir,
-            helper_executable,
             usage_cancelled: Arc::new(AtomicBool::new(false)),
             history_cancelled: Arc::new(AtomicBool::new(false)),
+            history_running: Arc::new(Mutex::new(HashSet::new())),
+            history_background_tokens: Arc::new(Mutex::new(HashMap::new())),
             codex: CodexAdapter::new(),
             claude: ClaudeAdapter::new(),
             claude_desktop: ClaudeDesktopAdapter::new(),
@@ -66,6 +74,30 @@ impl AppState {
         self.history_cancelled.store(true, Ordering::Release);
     }
 
+    pub fn begin_queued_history(&self, scope: HistoryScope) -> Option<HistoryTaskGuard> {
+        let mut running = self.history_running.lock().ok()?;
+        if !running.insert(scope) {
+            return None;
+        }
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let mut tokens = self.history_background_tokens.lock().ok()?;
+        tokens.insert(scope, Arc::clone(&cancelled));
+        Some(HistoryTaskGuard {
+            scope,
+            cancelled,
+            running: Arc::clone(&self.history_running),
+            tokens: Arc::clone(&self.history_background_tokens),
+        })
+    }
+
+    pub fn cancel_queued_history(&self, scope: HistoryScope) {
+        if let Ok(tokens) = self.history_background_tokens.lock()
+            && let Some(cancelled) = tokens.get(&scope)
+        {
+            cancelled.store(true, Ordering::Release);
+        }
+    }
+
     pub fn adapter(&self, platform: Platform) -> &dyn PlatformAdapter {
         match platform {
             Platform::Codex => &self.codex,
@@ -87,8 +119,7 @@ impl AppState {
             Platform::ClaudeDesktop => (settings.claude_desktop_path.as_deref(), None),
         };
         AdapterContext {
-            app_data_dir: self.app_data_dir.clone(),
-            helper_executable: self.helper_executable.clone(),
+            data_root: paths::app_data_dir().expect("YAAT data root was resolved at startup"),
             explicit_cli_path: cli.map(PathBuf::from),
             explicit_config_root: root.map(PathBuf::from),
         }
@@ -133,11 +164,13 @@ impl AppState {
             profile.platform,
             Platform::ClaudeCode | Platform::ClaudeDesktop
         ) && profile.kind != yaat_contracts::ProviderKind::OfficialSubscription
-            && profile.secret_kind != yaat_contracts::SecretKind::ApiKey
+            && !matches!(
+                profile.secret_kind,
+                yaat_contracts::SecretKind::ApiKey | yaat_contracts::SecretKind::BearerToken
+            )
         {
             return Err(AppError::Validation(
-                "Claude API profiles require an API key; bearer-token protocol conversion is not supported"
-                    .into(),
+                "Claude API profiles require an API key or bearer token".into(),
             ));
         }
         if profile.platform == Platform::ClaudeDesktop
@@ -150,5 +183,29 @@ impl AppState {
             .map_err(AppError::Validation)?;
         }
         Ok(())
+    }
+}
+
+pub struct HistoryTaskGuard {
+    scope: HistoryScope,
+    cancelled: Arc<AtomicBool>,
+    running: Arc<Mutex<HashSet<HistoryScope>>>,
+    tokens: Arc<Mutex<HashMap<HistoryScope, Arc<AtomicBool>>>>,
+}
+
+impl HistoryTaskGuard {
+    pub fn cancelled(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.cancelled)
+    }
+}
+
+impl Drop for HistoryTaskGuard {
+    fn drop(&mut self) {
+        if let Ok(mut tokens) = self.tokens.lock() {
+            tokens.remove(&self.scope);
+        }
+        if let Ok(mut running) = self.running.lock() {
+            running.remove(&self.scope);
+        }
     }
 }

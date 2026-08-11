@@ -18,9 +18,9 @@ use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, 
 use secrecy::{ExposeSecret, SecretSlice, SecretString};
 use uuid::Uuid;
 use yaat_contracts::{
-    ActivationMode, AppSettings, CreateProviderRequest, DeleteProviderRequest, Platform,
-    PlatformBinding, ProfileStatus, ProviderKind, ProviderProfile, SecretKind, TokenBreakdown,
-    UpdateProviderRequest, UsageDiagnostics,
+    ActivationMode, AppSettings, CreateProviderRequest, DeleteProviderRequest, HistoryScope,
+    HistorySyncState, HistorySyncStatus, Platform, PlatformBinding, ProfileStatus, ProviderKind,
+    ProviderProfile, SecretKind, TokenBreakdown, UpdateProviderRequest, UsageDiagnostics,
 };
 
 const DEFAULT_LANGUAGE: &str = "system";
@@ -46,6 +46,56 @@ impl fmt::Debug for Repository {
 }
 
 impl Repository {
+    pub fn list_history_sync_status(&self) -> Result<Vec<HistorySyncStatus>, DbError> {
+        let connection = self.lock()?;
+        let mut statuses = Vec::new();
+        for scope in [
+            HistoryScope::Codex,
+            HistoryScope::ClaudeCode,
+            HistoryScope::ClaudeDesktopCode,
+        ] {
+            let stored: Option<(String, i64, Option<i64>, Option<String>)> = connection
+                .query_row(
+                    "SELECT state, processed_files, last_completed_at, error_summary \
+                     FROM history_sync_status WHERE scope = ?1",
+                    [history_scope_to_db(scope)],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                )
+                .optional()?;
+            let (state, processed_files, last_completed_at, error_summary) =
+                stored.unwrap_or_else(|| ("idle".into(), 0, None, None));
+            statuses.push(HistorySyncStatus {
+                scope,
+                state: history_sync_state_from_db(&state)?,
+                processed_files: count_from_db(processed_files, "history.processed_files")?,
+                last_completed_at,
+                error_summary,
+            });
+        }
+        Ok(statuses)
+    }
+
+    pub fn save_history_sync_status(&self, status: &HistorySyncStatus) -> Result<(), DbError> {
+        let connection = self.lock()?;
+        connection.execute(
+            "INSERT INTO history_sync_status( \
+                scope, state, processed_files, last_completed_at, error_summary \
+             ) VALUES (?1, ?2, ?3, ?4, ?5) \
+             ON CONFLICT(scope) DO UPDATE SET state = excluded.state, \
+                processed_files = excluded.processed_files, \
+                last_completed_at = excluded.last_completed_at, \
+                error_summary = excluded.error_summary",
+            params![
+                history_scope_to_db(status.scope),
+                history_sync_state_to_db(status.state),
+                count_to_db(status.processed_files, "history.processed_files")?,
+                status.last_completed_at,
+                status.error_summary,
+            ],
+        )?;
+        Ok(())
+    }
+
     /// Open or create the local repository.
     pub fn open(path: impl AsRef<Path>) -> Result<Self, DbError> {
         let connection = Connection::open(path)?;
@@ -124,8 +174,9 @@ impl Repository {
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         transaction.execute(
             "INSERT INTO providers( \
-                id, platform, kind, name, account_label, base_url, model, secret_kind, status, created_at, updated_at \
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?10)",
+                id, platform, kind, name, account_label, base_url, model, custom_headers, \
+                user_agent, platform_config, secret_kind, status, created_at, updated_at \
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?13)",
             params![
                 id,
                 request.platform.as_str(),
@@ -134,6 +185,9 @@ impl Repository {
                 request.account_label,
                 request.base_url,
                 request.model,
+                encode_json(&request.custom_headers)?,
+                request.user_agent,
+                encode_json(&request.platform_config)?,
                 secret_kind_to_db(request.secret_kind),
                 profile_status_to_db(status),
                 now,
@@ -178,14 +232,17 @@ impl Repository {
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let changed = transaction.execute(
             "UPDATE providers SET \
-                name = ?1, account_label = ?2, base_url = ?3, model = ?4, secret_kind = ?5, \
-                updated_at = ?6 \
-             WHERE id = ?7",
+                name = ?1, account_label = ?2, base_url = ?3, model = ?4, custom_headers = ?5, \
+                user_agent = ?6, platform_config = ?7, secret_kind = ?8, updated_at = ?9 \
+             WHERE id = ?10",
             params![
                 request.name.trim(),
                 request.account_label,
                 request.base_url,
                 request.model,
+                encode_json(&request.custom_headers)?,
+                request.user_agent,
+                encode_json(&request.platform_config)?,
                 secret_kind_to_db(request.secret_kind),
                 now,
                 request.id,
@@ -345,7 +402,8 @@ impl Repository {
                 "SELECT language, theme, timezone, default_activation_mode, \
                     codex_path, claude_path, claude_desktop_path, codex_home, \
                     claude_config_dir, unify_codex_history, unify_claude_code_history, \
-                    unify_claude_desktop_code_history, claude_desktop_history_target \
+                    unify_claude_desktop_code_history, claude_desktop_history_target, \
+                    usage_refresh_interval_seconds \
              FROM settings WHERE singleton_id = 1",
                 [],
                 |row| {
@@ -363,6 +421,7 @@ impl Repository {
                         unify_claude_code_history: row.get(10)?,
                         unify_claude_desktop_code_history: row.get(11)?,
                         claude_desktop_history_target: row.get(12)?,
+                        usage_refresh_interval_seconds: row.get(13)?,
                     })
                 },
             )
@@ -379,7 +438,7 @@ impl Repository {
                 codex_home = ?8, claude_config_dir = ?9, \
                 unify_codex_history = ?10, unify_claude_code_history = ?11, \
                 unify_claude_desktop_code_history = ?12, claude_desktop_history_target = ?13, \
-                updated_at = ?14 WHERE singleton_id = 1",
+                usage_refresh_interval_seconds = ?14, updated_at = ?15 WHERE singleton_id = 1",
             params![
                 settings.language,
                 settings.theme,
@@ -394,6 +453,10 @@ impl Repository {
                 bool_to_db(settings.unify_claude_code_history),
                 bool_to_db(settings.unify_claude_desktop_code_history),
                 settings.claude_desktop_history_target,
+                count_to_db(
+                    settings.usage_refresh_interval_seconds,
+                    "usage_refresh_interval_seconds"
+                )?,
                 now_millis(),
             ],
         )?;
@@ -424,6 +487,9 @@ impl Repository {
             account_label: row.account_label,
             base_url: row.base_url,
             model: row.model,
+            custom_headers: decode_json(&row.custom_headers, "provider.custom_headers")?,
+            user_agent: row.user_agent,
+            platform_config: decode_json(&row.platform_config, "provider.platform_config")?,
             secret_kind: secret_kind_from_db(&row.secret_kind)?,
             has_secret: row.has_secret,
             profile_home: row.profile_home,
@@ -502,8 +568,8 @@ impl Repository {
 }
 
 const PROVIDER_SELECT: &str = "SELECT \
-    p.id, p.platform, p.kind, p.name, p.account_label, p.base_url, p.model, p.secret_kind, \
-    p.profile_home, p.status, p.created_at, p.updated_at, \
+    p.id, p.platform, p.kind, p.name, p.account_label, p.base_url, p.model, p.custom_headers, \
+    p.user_agent, p.platform_config, p.secret_kind, p.profile_home, p.status, p.created_at, p.updated_at, \
     EXISTS(SELECT 1 FROM account_data d WHERE d.record_id = ('provider/' || p.id || '/credential')) \
  FROM providers p";
 
@@ -516,6 +582,9 @@ struct ProviderRow {
     account_label: Option<String>,
     base_url: Option<String>,
     model: Option<String>,
+    custom_headers: String,
+    user_agent: Option<String>,
+    platform_config: String,
     secret_kind: String,
     profile_home: Option<String>,
     status: String,
@@ -533,12 +602,15 @@ fn provider_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ProviderRow> {
         account_label: row.get(4)?,
         base_url: row.get(5)?,
         model: row.get(6)?,
-        secret_kind: row.get(7)?,
-        profile_home: row.get(8)?,
-        status: row.get(9)?,
-        created_at: row.get(10)?,
-        updated_at: row.get(11)?,
-        has_secret: row.get(12)?,
+        custom_headers: row.get(7)?,
+        user_agent: row.get(8)?,
+        platform_config: row.get(9)?,
+        secret_kind: row.get(10)?,
+        profile_home: row.get(11)?,
+        status: row.get(12)?,
+        created_at: row.get(13)?,
+        updated_at: row.get(14)?,
+        has_secret: row.get(15)?,
     })
 }
 
@@ -631,6 +703,7 @@ struct SettingsRow {
     unify_claude_code_history: i64,
     unify_claude_desktop_code_history: i64,
     claude_desktop_history_target: Option<String>,
+    usage_refresh_interval_seconds: i64,
 }
 
 fn settings_from_row(row: SettingsRow) -> Result<AppSettings, DbError> {
@@ -654,6 +727,27 @@ fn settings_from_row(row: SettingsRow) -> Result<AppSettings, DbError> {
             "settings.unify_claude_desktop_code_history",
         )?,
         claude_desktop_history_target: row.claude_desktop_history_target,
+        usage_refresh_interval_seconds: count_from_db(
+            row.usage_refresh_interval_seconds,
+            "settings.usage_refresh_interval_seconds",
+        )?,
+    })
+}
+
+fn encode_json<T: serde::Serialize>(value: &T) -> Result<String, DbError> {
+    serde_json::to_string(value).map_err(|error| DbError::InvalidJson {
+        field: "provider configuration",
+        message: error.to_string(),
+    })
+}
+
+fn decode_json<T: serde::de::DeserializeOwned>(
+    value: &str,
+    field: &'static str,
+) -> Result<T, DbError> {
+    serde_json::from_str(value).map_err(|error| DbError::InvalidJson {
+        field,
+        message: error.to_string(),
     })
 }
 
@@ -814,9 +908,31 @@ pub struct UsageRecordInput {
     /// is the idempotency key.
     pub event_id: String,
     pub platform: Platform,
+    pub source_path: String,
     pub occurred_at: i64,
+    pub model: Option<String>,
     pub tokens: TokenBreakdown,
     pub request_count: u64,
+}
+
+#[derive(Clone, Debug)]
+pub struct UsageSourceInput {
+    pub source_path: String,
+    pub file_size: u64,
+    pub modified_at: i64,
+    pub fingerprint: String,
+    pub malformed_records: u64,
+    pub records: Vec<UsageRecordInput>,
+}
+
+#[derive(Clone, Debug)]
+pub struct HistorySourceState {
+    pub root_id: String,
+    pub source_path: String,
+    pub session_key: String,
+    pub file_size: u64,
+    pub modified_at: i64,
+    pub fingerprint: String,
 }
 
 #[derive(Clone, Debug)]
@@ -826,7 +942,201 @@ pub struct UsageScanSummary {
 }
 
 impl Repository {
+    pub fn history_source_states(
+        &self,
+        scope: HistoryScope,
+    ) -> Result<Vec<HistorySourceState>, DbError> {
+        let connection = self.lock()?;
+        let mut statement = connection.prepare(
+            "SELECT root_id, source_path, session_key, file_size, modified_at, fingerprint \
+             FROM history_sources WHERE scope = ?1",
+        )?;
+        let rows = statement
+            .query_map([history_scope_to_db(scope)], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, i64>(4)?,
+                    row.get::<_, String>(5)?,
+                ))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        rows.into_iter()
+            .map(
+                |(root_id, source_path, session_key, file_size, modified_at, fingerprint)| {
+                    Ok(HistorySourceState {
+                        root_id,
+                        source_path,
+                        session_key,
+                        file_size: count_from_db(file_size, "history_source.file_size")?,
+                        modified_at,
+                        fingerprint,
+                    })
+                },
+            )
+            .collect()
+    }
+
+    pub fn replace_history_sources(
+        &self,
+        scope: HistoryScope,
+        sources: &[HistorySourceState],
+    ) -> Result<(), DbError> {
+        let mut connection = self.lock()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        transaction.execute(
+            "DELETE FROM history_sources WHERE scope = ?1",
+            [history_scope_to_db(scope)],
+        )?;
+        let now = now_millis();
+        for source in sources {
+            transaction.execute(
+                "INSERT INTO history_sources( \
+                    scope, root_id, source_path, session_key, file_size, modified_at, fingerprint, processed_at \
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                params![
+                    history_scope_to_db(scope),
+                    source.root_id,
+                    source.source_path,
+                    source.session_key,
+                    count_to_db(source.file_size, "history_source.file_size")?,
+                    source.modified_at,
+                    source.fingerprint,
+                    now,
+                ],
+            )?;
+        }
+        transaction.commit()?;
+        Ok(())
+    }
+
+    pub fn usage_source_matches(
+        &self,
+        platform: Platform,
+        source_path: &str,
+        file_size: u64,
+        modified_at: i64,
+    ) -> Result<bool, DbError> {
+        let connection = self.lock()?;
+        let stored: Option<(i64, i64)> = connection
+            .query_row(
+                "SELECT file_size, modified_at FROM usage_sources \
+                 WHERE platform = ?1 AND source_path = ?2",
+                params![platform.as_str(), source_path],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        Ok(stored.is_some_and(|(size, modified)| {
+            size == i64::try_from(file_size).unwrap_or(-1) && modified == modified_at
+        }))
+    }
+
+    pub fn merge_usage_sources(
+        &self,
+        platform: Platform,
+        sources: &[UsageSourceInput],
+        seen_paths: &std::collections::HashSet<String>,
+    ) -> Result<usize, DbError> {
+        let mut connection = self.lock()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let now = now_millis();
+        for source in sources {
+            transaction.execute(
+                "INSERT INTO usage_sources( \
+                    platform, source_path, file_size, modified_at, fingerprint, malformed_records, scanned_at \
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7) \
+                 ON CONFLICT(platform, source_path) DO UPDATE SET \
+                    file_size = excluded.file_size, modified_at = excluded.modified_at, \
+                    fingerprint = excluded.fingerprint, malformed_records = excluded.malformed_records, \
+                    scanned_at = excluded.scanned_at",
+                params![
+                    platform.as_str(),
+                    source.source_path,
+                    count_to_db(source.file_size, "usage_source.file_size")?,
+                    source.modified_at,
+                    source.fingerprint,
+                    count_to_db(source.malformed_records, "usage_source.malformed_records")?,
+                    now,
+                ],
+            )?;
+            transaction.execute(
+                "DELETE FROM usage_event_sources WHERE platform = ?1 AND source_path = ?2",
+                params![platform.as_str(), source.source_path],
+            )?;
+            for usage in &source.records {
+                if usage.platform != platform || usage.source_path != source.source_path {
+                    return Err(DbError::InvalidInput(
+                        "usage source contains mismatched records",
+                    ));
+                }
+                validate_usage(usage)?;
+                transaction.execute(
+                    "INSERT INTO usage_events( \
+                        platform, event_id, model, occurred_at, uncached_input, cache_read, cache_write, \
+                        output, reasoning_output, request_count, created_at \
+                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11) \
+                     ON CONFLICT(platform, event_id) DO UPDATE SET \
+                        model = excluded.model, occurred_at = excluded.occurred_at, \
+                        uncached_input = excluded.uncached_input, cache_read = excluded.cache_read, \
+                        cache_write = excluded.cache_write, output = excluded.output, \
+                        reasoning_output = excluded.reasoning_output, request_count = excluded.request_count",
+                    params![
+                        platform.as_str(),
+                        usage.event_id,
+                        usage.model,
+                        usage.occurred_at,
+                        count_to_db(usage.tokens.uncached_input, "uncached_input")?,
+                        count_to_db(usage.tokens.cache_read, "cache_read")?,
+                        count_to_db(usage.tokens.cache_write, "cache_write")?,
+                        count_to_db(usage.tokens.output, "output")?,
+                        count_to_db(usage.tokens.reasoning_output, "reasoning_output")?,
+                        count_to_db(usage.request_count, "request_count")?,
+                        now,
+                    ],
+                )?;
+                transaction.execute(
+                    "INSERT OR IGNORE INTO usage_event_sources(platform, event_id, source_path) \
+                     VALUES (?1, ?2, ?3)",
+                    params![platform.as_str(), usage.event_id, source.source_path],
+                )?;
+            }
+        }
+
+        let existing = {
+            let mut statement =
+                transaction.prepare("SELECT source_path FROM usage_sources WHERE platform = ?1")?;
+            statement
+                .query_map([platform.as_str()], |row| row.get::<_, String>(0))?
+                .collect::<Result<Vec<_>, _>>()?
+        };
+        for path in existing {
+            if !seen_paths.contains(&path) {
+                transaction.execute(
+                    "DELETE FROM usage_sources WHERE platform = ?1 AND source_path = ?2",
+                    params![platform.as_str(), path],
+                )?;
+            }
+        }
+        transaction.execute(
+            "DELETE FROM usage_events WHERE platform = ?1 AND NOT EXISTS ( \
+                SELECT 1 FROM usage_event_sources s \
+                WHERE s.platform = usage_events.platform AND s.event_id = usage_events.event_id \
+             )",
+            [platform.as_str()],
+        )?;
+        let count: i64 = transaction.query_row(
+            "SELECT COUNT(*) FROM usage_events WHERE platform = ?1",
+            [platform.as_str()],
+            |row| row.get(0),
+        )?;
+        transaction.commit()?;
+        usize::try_from(count).map_err(|_| DbError::CorruptInteger("usage count"))
+    }
+
     /// Replaces one platform's local usage index with a complete scan snapshot.
+    #[cfg(test)]
     pub fn replace_usage_snapshot(
         &self,
         platform: Platform,
@@ -842,18 +1152,26 @@ impl Repository {
         }
         let mut connection = self.lock()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        transaction.execute("DELETE FROM usage WHERE platform = ?1", [platform.as_str()])?;
+        transaction.execute(
+            "DELETE FROM usage_events WHERE platform = ?1",
+            [platform.as_str()],
+        )?;
+        transaction.execute(
+            "DELETE FROM usage_sources WHERE platform = ?1",
+            [platform.as_str()],
+        )?;
         let mut statement = transaction.prepare(
-            "INSERT OR REPLACE INTO usage( \
-                platform, event_id, occurred_at, uncached_input, cache_read, \
+            "INSERT OR REPLACE INTO usage_events( \
+                platform, event_id, model, occurred_at, uncached_input, cache_read, \
                 cache_write, output, reasoning_output, request_count, created_at \
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
         )?;
         let now = now_millis();
         for usage in records {
             statement.execute(params![
                 usage.platform.as_str(),
                 usage.event_id,
+                usage.model,
                 usage.occurred_at,
                 count_to_db(usage.tokens.uncached_input, "uncached_input")?,
                 count_to_db(usage.tokens.cache_read, "cache_read")?,
@@ -866,7 +1184,7 @@ impl Repository {
         }
         drop(statement);
         let count: i64 = transaction.query_row(
-            "SELECT COUNT(*) FROM usage WHERE platform = ?1",
+            "SELECT COUNT(*) FROM usage_events WHERE platform = ?1",
             [platform.as_str()],
             |row| row.get(0),
         )?;
@@ -881,35 +1199,51 @@ impl Repository {
         platform: Platform,
         start_at: i64,
         end_at: i64,
+        model: Option<&str>,
     ) -> Result<Vec<UsageRecordInput>, DbError> {
         if end_at < start_at {
             return Err(DbError::InvalidInput("usage end must not precede start"));
         }
         let connection = self.lock()?;
         let mut statement = connection.prepare(
-            "SELECT event_id, occurred_at, uncached_input, cache_read, cache_write, \
+            "SELECT event_id, model, occurred_at, uncached_input, cache_read, cache_write, \
                     output, reasoning_output, request_count \
-             FROM usage \
+             FROM usage_events \
              WHERE platform = ?1 AND occurred_at >= ?2 AND occurred_at < ?3 \
+               AND (?4 IS NULL OR model = ?4) \
              ORDER BY occurred_at, event_id",
         )?;
         let rows = statement
-            .query_map(params![platform.as_str(), start_at, end_at], |row| {
+            .query_map(params![platform.as_str(), start_at, end_at, model], |row| {
                 Ok(UsageRow {
                     event_id: row.get(0)?,
-                    occurred_at: row.get(1)?,
-                    uncached_input: row.get(2)?,
-                    cache_read: row.get(3)?,
-                    cache_write: row.get(4)?,
-                    output: row.get(5)?,
-                    reasoning_output: row.get(6)?,
-                    request_count: row.get(7)?,
+                    model: row.get(1)?,
+                    occurred_at: row.get(2)?,
+                    uncached_input: row.get(3)?,
+                    cache_read: row.get(4)?,
+                    cache_write: row.get(5)?,
+                    output: row.get(6)?,
+                    reasoning_output: row.get(7)?,
+                    request_count: row.get(8)?,
                 })
             })?
             .collect::<Result<Vec<_>, _>>()?;
         rows.into_iter()
             .map(|row| usage_from_row(platform, row))
             .collect()
+    }
+
+    pub fn usage_models(&self, platform: Platform) -> Result<Vec<String>, DbError> {
+        let connection = self.lock()?;
+        let mut statement = connection.prepare(
+            "SELECT DISTINCT model FROM usage_events \
+             WHERE platform = ?1 AND model IS NOT NULL AND length(trim(model)) > 0 \
+             ORDER BY model COLLATE NOCASE",
+        )?;
+        statement
+            .query_map([platform.as_str()], |row| row.get(0))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(DbError::from)
     }
 
     pub fn load_usage_scan_summary(
@@ -967,6 +1301,7 @@ impl Repository {
 
 struct UsageRow {
     event_id: String,
+    model: Option<String>,
     occurred_at: i64,
     uncached_input: i64,
     cache_read: i64,
@@ -980,7 +1315,9 @@ fn usage_from_row(platform: Platform, row: UsageRow) -> Result<UsageRecordInput,
     Ok(UsageRecordInput {
         event_id: row.event_id,
         platform,
+        source_path: String::new(),
         occurred_at: row.occurred_at,
+        model: row.model,
         tokens: TokenBreakdown {
             uncached_input: count_from_db(row.uncached_input, "uncached_input")?,
             cache_read: count_from_db(row.cache_read, "cache_read")?,
@@ -1269,6 +1606,42 @@ fn platform_from_db(value: &str) -> Result<Platform, DbError> {
     }
 }
 
+const fn history_scope_to_db(scope: HistoryScope) -> &'static str {
+    match scope {
+        HistoryScope::Codex => "codex",
+        HistoryScope::ClaudeCode => "claude_code",
+        HistoryScope::ClaudeDesktopCode => "claude_desktop_code",
+    }
+}
+
+const fn history_sync_state_to_db(state: HistorySyncState) -> &'static str {
+    match state {
+        HistorySyncState::Idle => "idle",
+        HistorySyncState::Queued => "queued",
+        HistorySyncState::Scanning => "scanning",
+        HistorySyncState::Normalizing => "normalizing",
+        HistorySyncState::Completed => "completed",
+        HistorySyncState::Failed => "failed",
+        HistorySyncState::Cancelled => "cancelled",
+    }
+}
+
+fn history_sync_state_from_db(value: &str) -> Result<HistorySyncState, DbError> {
+    match value {
+        "idle" => Ok(HistorySyncState::Idle),
+        "queued" => Ok(HistorySyncState::Queued),
+        "scanning" => Ok(HistorySyncState::Scanning),
+        "normalizing" => Ok(HistorySyncState::Normalizing),
+        "completed" => Ok(HistorySyncState::Completed),
+        "failed" => Ok(HistorySyncState::Failed),
+        "cancelled" => Ok(HistorySyncState::Cancelled),
+        _ => Err(DbError::InvalidEnum {
+            field: "history_sync_status.state",
+            value: value.to_owned(),
+        }),
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum DbError {
     #[error("SQLite operation failed: {0}")]
@@ -1287,6 +1660,11 @@ pub enum DbError {
     },
     #[error("invalid persisted enum in {field}: '{value}'")]
     InvalidEnum { field: &'static str, value: String },
+    #[error("invalid persisted JSON in {field}: {message}")]
+    InvalidJson {
+        field: &'static str,
+        message: String,
+    },
     #[error("invalid input: {0}")]
     InvalidInput(&'static str),
     #[error("integer '{0}' exceeds SQLite's signed range")]
@@ -1327,6 +1705,9 @@ mod tests {
                 account_label: Some(label.to_owned()),
                 base_url: Some("https://api.example.test".to_owned()),
                 model: Some("model-a".to_owned()),
+                custom_headers: Vec::new(),
+                user_agent: None,
+                platform_config: yaat_contracts::ProviderPlatformConfig::empty_for(platform),
                 secret_kind: SecretKind::ApiKey,
                 secret: Some(secret.to_owned()),
                 official_credential: None,
@@ -1351,8 +1732,12 @@ mod tests {
             "platform_bindings",
             "settings",
             "account_data",
-            "usage",
+            "usage_events",
+            "usage_sources",
+            "usage_event_sources",
             "usage_scan_summary",
+            "history_sources",
+            "history_sync_status",
             "schema_migrations",
         ] {
             assert!(tables.contains(required), "missing {required}");
@@ -1412,6 +1797,9 @@ mod tests {
                 account_label: None,
                 base_url: None,
                 model: None,
+                custom_headers: Vec::new(),
+                user_agent: None,
+                platform_config: yaat_contracts::ProviderPlatformConfig::empty_for(Platform::Codex),
                 secret_kind: SecretKind::None,
                 secret: None,
                 official_credential: None,
@@ -1577,7 +1965,9 @@ mod tests {
         let mut usage = UsageRecordInput {
             event_id: "stable-event".to_owned(),
             platform: Platform::ClaudeCode,
+            source_path: "/tmp/session.jsonl".into(),
             occurred_at: 1_234,
+            model: Some("claude-sonnet-5".into()),
             tokens: TokenBreakdown {
                 output: 1,
                 ..TokenBreakdown::default()
@@ -1593,7 +1983,7 @@ mod tests {
             .unwrap();
 
         let rows = repository
-            .usage_rows(Platform::ClaudeCode, 1_000, 2_000)
+            .usage_rows(Platform::ClaudeCode, 1_000, 2_000, None)
             .unwrap();
         assert_eq!(rows[0].tokens.output, 100);
     }

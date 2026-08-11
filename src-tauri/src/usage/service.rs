@@ -9,16 +9,18 @@ use std::io::{Cursor, Read};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::UNIX_EPOCH;
 
 use chrono::{LocalResult, NaiveDate, TimeZone, Utc};
 use chrono_tz::Tz;
+use sha2::{Digest, Sha256};
 use walkdir::WalkDir;
 use yaat_contracts::{
     OperationPhase, OperationProgress, Platform, TokenBreakdown, UsageBucket, UsageDiagnostics,
     UsageQueryRequest, UsageReport,
 };
 
-use crate::db::{Repository, UsageRecordInput, UsageScanSummary};
+use crate::db::{Repository, UsageRecordInput, UsageScanSummary, UsageSourceInput};
 use crate::error::{AppError, AppResult};
 use crate::usage::UsageEventDraft;
 
@@ -38,6 +40,11 @@ pub struct ScanSummary {
     pub diagnostics: UsageDiagnostics,
 }
 
+struct SourceIndex<'a> {
+    repository: &'a Repository,
+    use_cache: bool,
+}
+
 #[cfg(test)]
 pub fn scan(repo: &Repository, platform: Platform, roots: &[UsageRoot]) -> AppResult<ScanSummary> {
     scan_cancellable(repo, platform, roots, &AtomicBool::new(false), |_| {})
@@ -48,11 +55,37 @@ pub fn scan_cancellable(
     platform: Platform,
     roots: &[UsageRoot],
     cancelled: &AtomicBool,
+    progress: impl FnMut(OperationProgress),
+) -> AppResult<ScanSummary> {
+    scan_with_cache(repo, platform, roots, true, cancelled, progress)
+}
+
+pub fn scan_full_cancellable(
+    repo: &Repository,
+    platform: Platform,
+    roots: &[UsageRoot],
+    cancelled: &AtomicBool,
+    progress: impl FnMut(OperationProgress),
+) -> AppResult<ScanSummary> {
+    scan_with_cache(repo, platform, roots, false, cancelled, progress)
+}
+
+fn scan_with_cache(
+    repo: &Repository,
+    platform: Platform,
+    roots: &[UsageRoot],
+    use_cache: bool,
+    cancelled: &AtomicBool,
     mut progress: impl FnMut(OperationProgress),
 ) -> AppResult<ScanSummary> {
     let roots = unique_roots(roots);
     let mut diagnostics = UsageDiagnostics::default();
-    let mut records = Vec::new();
+    let mut sources = Vec::new();
+    let mut seen_paths = HashSet::new();
+    let source_index = SourceIndex {
+        repository: repo,
+        use_cache,
+    };
 
     progress(OperationProgress {
         phase: OperationPhase::Discovering,
@@ -62,15 +95,19 @@ pub fn scan_cancellable(
 
     match platform {
         Platform::Codex => scan_codex(
+            &source_index,
             &roots,
-            &mut records,
+            &mut sources,
+            &mut seen_paths,
             &mut diagnostics,
             cancelled,
             &mut progress,
         )?,
         Platform::ClaudeCode => scan_claude(
+            &source_index,
             &roots,
-            &mut records,
+            &mut sources,
+            &mut seen_paths,
             &mut diagnostics,
             cancelled,
             &mut progress,
@@ -90,8 +127,9 @@ pub fn scan_cancellable(
     });
 
     let indexed = repo
-        .replace_usage_snapshot(platform, &records)
+        .merge_usage_sources(platform, &sources, &seen_paths)
         .map_err(AppError::database)?;
+    diagnostics.files_scanned = seen_paths.len() as u64;
     let state = UsageScanSummary {
         platform,
         diagnostics: diagnostics.clone(),
@@ -128,7 +166,18 @@ pub fn query(repo: &Repository, request: &UsageQueryRequest) -> AppResult<UsageR
         .ok_or_else(|| AppError::Validation("usage end date is out of range".into()))?;
     let end_at = local_day_start(timezone, exclusive_end_date)?;
     let rows = repo
-        .usage_rows(request.platform, start_at, end_at)
+        .usage_rows(
+            request.platform,
+            start_at,
+            end_at,
+            request
+                .model
+                .as_deref()
+                .filter(|value| !value.trim().is_empty()),
+        )
+        .map_err(AppError::database)?;
+    let available_models = repo
+        .usage_models(request.platform)
         .map_err(AppError::database)?;
 
     let mut buckets = BTreeMap::<String, UsageBucket>::new();
@@ -169,11 +218,24 @@ pub fn query(repo: &Repository, request: &UsageQueryRequest) -> AppResult<UsageR
         .map_err(AppError::database)?
         .map_or_else(UsageDiagnostics::default, |state| state.diagnostics);
 
+    let cache_denominator = totals
+        .uncached_input
+        .saturating_add(totals.cache_read)
+        .saturating_add(totals.cache_write);
+    let cache_hit_rate = if cache_denominator == 0 {
+        0.0
+    } else {
+        totals.cache_read as f64 / cache_denominator as f64
+    };
     Ok(UsageReport {
         platform: request.platform,
         start_date: request.start_date.clone(),
         end_date: request.end_date.clone(),
         timezone: request.timezone.clone(),
+        selected_model: request.model.clone(),
+        available_models,
+        cache_hit_tokens: totals.cache_read,
+        cache_hit_rate,
         totals,
         request_count,
         buckets: buckets.into_values().collect(),
@@ -182,8 +244,10 @@ pub fn query(repo: &Repository, request: &UsageQueryRequest) -> AppResult<UsageR
 }
 
 fn scan_codex(
+    source_index: &SourceIndex<'_>,
     roots: &[UsageRoot],
-    records: &mut Vec<UsageRecordInput>,
+    sources: &mut Vec<UsageSourceInput>,
+    seen_paths: &mut HashSet<String>,
     diagnostics: &mut UsageDiagnostics,
     cancelled: &AtomicBool,
     progress: &mut impl FnMut(OperationProgress),
@@ -205,20 +269,61 @@ fn scan_codex(
     });
     for (index, path) in paths.into_iter().enumerate() {
         check_cancelled(cancelled)?;
-        let parsed = if path.to_string_lossy().ends_with(".jsonl.zst") {
-            read_zstd_limited(&path).map(|bytes| codex::parse_bytes(&bytes))
-        } else {
-            read_usage_source_limited(&path).map(|bytes| codex::parse_bytes(&bytes))
-        };
+        let (source_path, file_size, modified_at) = source_metadata(&path)?;
+        seen_paths.insert(source_path.clone());
+        if source_index.use_cache
+            && source_index
+                .repository
+                .usage_source_matches(Platform::Codex, &source_path, file_size, modified_at)
+                .map_err(AppError::database)?
+        {
+            progress(OperationProgress {
+                phase: OperationPhase::Processing,
+                processed: index as u64 + 1,
+                total: Some(total),
+            });
+            continue;
+        }
+        let raw = read_usage_source_limited(&path);
+        let parsed = raw.as_ref().map_err(Clone::clone).and_then(|raw| {
+            if path.to_string_lossy().ends_with(".jsonl.zst") {
+                decode_zstd_bytes_limited(raw).map(|bytes| codex::parse_bytes(&bytes))
+            } else {
+                Ok(codex::parse_bytes(raw))
+            }
+        });
+        let fingerprint = raw
+            .as_ref()
+            .map(|bytes| fingerprint(bytes))
+            .unwrap_or_else(|_| format!("unreadable:{file_size}:{modified_at}"));
         match parsed {
             Ok(parsed) => {
                 merge_diagnostics(diagnostics, &parsed.diagnostics);
-                records.extend(parsed.events.into_iter().map(usage_record));
+                let malformed_records = parsed.diagnostics.malformed_records;
+                sources.push(UsageSourceInput {
+                    source_path: source_path.clone(),
+                    file_size,
+                    modified_at,
+                    fingerprint,
+                    malformed_records,
+                    records: parsed
+                        .events
+                        .into_iter()
+                        .map(|event| usage_record(event, &source_path))
+                        .collect(),
+                });
             }
             Err(_) => {
-                diagnostics.files_scanned = diagnostics.files_scanned.saturating_add(1);
                 diagnostics.malformed_records = diagnostics.malformed_records.saturating_add(1);
                 diagnostics.is_partial = true;
+                sources.push(UsageSourceInput {
+                    source_path,
+                    file_size,
+                    modified_at,
+                    fingerprint,
+                    malformed_records: 1,
+                    records: Vec::new(),
+                });
             }
         }
         progress(OperationProgress {
@@ -231,13 +336,16 @@ fn scan_codex(
 }
 
 fn scan_claude(
+    source_index: &SourceIndex<'_>,
     roots: &[UsageRoot],
-    records: &mut Vec<UsageRecordInput>,
+    changed_sources: &mut Vec<UsageSourceInput>,
+    seen_paths: &mut HashSet<String>,
     diagnostics: &mut UsageDiagnostics,
     cancelled: &AtomicBool,
     progress: &mut impl FnMut(OperationProgress),
 ) -> AppResult<()> {
     let mut events = Vec::new();
+    let mut event_sources = BTreeMap::<String, String>::new();
     let mut sources = Vec::new();
 
     for root in roots {
@@ -255,12 +363,34 @@ fn scan_claude(
     });
     for (index, (path, root)) in sources.into_iter().enumerate() {
         check_cancelled(cancelled)?;
+        let (source_path, file_size, modified_at) = source_metadata(&path)?;
+        seen_paths.insert(source_path.clone());
+        if source_index.use_cache
+            && source_index
+                .repository
+                .usage_source_matches(Platform::ClaudeCode, &source_path, file_size, modified_at)
+                .map_err(AppError::database)?
+        {
+            progress(OperationProgress {
+                phase: OperationPhase::Processing,
+                processed: index as u64 + 1,
+                total: Some(total),
+            });
+            continue;
+        }
         let bytes = match read_usage_source_limited(&path) {
             Ok(bytes) => bytes,
             Err(_) => {
-                diagnostics.files_scanned = diagnostics.files_scanned.saturating_add(1);
                 diagnostics.malformed_records = diagnostics.malformed_records.saturating_add(1);
                 diagnostics.is_partial = true;
+                changed_sources.push(UsageSourceInput {
+                    source_path,
+                    file_size,
+                    modified_at,
+                    fingerprint: format!("unreadable:{file_size}:{modified_at}"),
+                    malformed_records: 1,
+                    records: Vec::new(),
+                });
                 progress(OperationProgress {
                     phase: OperationPhase::Processing,
                     processed: index as u64 + 1,
@@ -272,6 +402,17 @@ fn scan_claude(
         let source = claude::ClaudeSource::from_path(&path, &root);
         let outcome = claude::parse_jsonl(&bytes, &source);
         merge_diagnostics(diagnostics, &outcome.diagnostics);
+        for event in &outcome.events {
+            event_sources.insert(event.source_event_key.clone(), source_path.clone());
+        }
+        changed_sources.push(UsageSourceInput {
+            source_path,
+            file_size,
+            modified_at,
+            fingerprint: fingerprint(&bytes),
+            malformed_records: outcome.diagnostics.malformed_records,
+            records: Vec::new(),
+        });
         events.extend(outcome.events);
         progress(OperationProgress {
             phase: OperationPhase::Processing,
@@ -285,7 +426,24 @@ fn scan_claude(
     diagnostics.duplicate_records = diagnostics
         .duplicate_records
         .saturating_add(reconciled.duplicate_records);
-    records.extend(reconciled.events.into_iter().map(usage_record));
+    let mut source_indexes = changed_sources
+        .iter()
+        .enumerate()
+        .map(|(index, source)| (source.source_path.clone(), index))
+        .collect::<BTreeMap<_, _>>();
+    for event in reconciled.events {
+        let Some(source_path) = event_sources.get(&event.source_event_key) else {
+            continue;
+        };
+        if let Some(index) = source_indexes.remove(source_path) {
+            source_indexes.insert(source_path.clone(), index);
+        }
+        if let Some(index) = source_indexes.get(source_path).copied() {
+            changed_sources[index]
+                .records
+                .push(usage_record(event, source_path));
+        }
+    }
     Ok(())
 }
 
@@ -338,8 +496,13 @@ fn read_usage_source_limited(path: &Path) -> Result<Vec<u8>, String> {
     fs::read(path).map_err(|error| error.to_string())
 }
 
+#[cfg(test)]
 fn read_zstd_limited(path: &Path) -> Result<Vec<u8>, String> {
     let compressed = read_usage_source_limited(path)?;
+    decode_zstd_bytes_limited(&compressed)
+}
+
+fn decode_zstd_bytes_limited(compressed: &[u8]) -> Result<Vec<u8>, String> {
     let decoder = zstd::stream::read::Decoder::new(Cursor::new(compressed))
         .map_err(|error| error.to_string())?;
     let mut decoded = Vec::new();
@@ -362,14 +525,42 @@ fn unique_roots(roots: &[UsageRoot]) -> Vec<UsageRoot> {
         .collect()
 }
 
-fn usage_record(event: UsageEventDraft) -> UsageRecordInput {
+fn usage_record(event: UsageEventDraft, source_path: &str) -> UsageRecordInput {
     UsageRecordInput {
         event_id: event.source_event_key,
         platform: event.platform,
+        source_path: source_path.to_owned(),
         occurred_at: event.occurred_at_ms,
+        model: event.model,
         tokens: event.tokens,
         request_count: event.request_count,
     }
+}
+
+fn source_metadata(path: &Path) -> AppResult<(String, u64, i64)> {
+    let metadata = fs::metadata(path).map_err(AppError::io)?;
+    if !metadata.is_file() {
+        return Err(AppError::Validation(format!(
+            "usage source is not a regular file: {}",
+            path.display()
+        )));
+    }
+    let modified_at = metadata
+        .modified()
+        .map_err(AppError::io)?
+        .duration_since(UNIX_EPOCH)
+        .map_err(|_| AppError::Validation("usage source timestamp predates the epoch".into()))?
+        .as_millis();
+    Ok((
+        path.to_string_lossy().into_owned(),
+        metadata.len(),
+        i64::try_from(modified_at)
+            .map_err(|_| AppError::Validation("usage source timestamp is out of range".into()))?,
+    ))
+}
+
+fn fingerprint(bytes: &[u8]) -> String {
+    hex::encode(Sha256::digest(bytes))
 }
 
 fn merge_diagnostics(target: &mut UsageDiagnostics, source: &UsageDiagnostics) {
@@ -502,7 +693,7 @@ mod tests {
         )
         .unwrap();
         let rows = repository
-            .usage_rows(Platform::ClaudeCode, 0, i64::MAX)
+            .usage_rows(Platform::ClaudeCode, 0, i64::MAX, None)
             .unwrap();
 
         assert_eq!(summary.indexed, 1);

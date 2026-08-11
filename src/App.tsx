@@ -339,7 +339,12 @@ export default function App() {
   };
 
   const queryUsage = useCallback(
-    async (startDate: string, endDate: string, rescan = false) => {
+    async (
+      startDate: string,
+      endDate: string,
+      rescan = false,
+      model: string | null = null,
+    ) => {
       const showProgress = rescan || platformUsage === null;
       if (showProgress) {
         setUsageLoading(true);
@@ -353,6 +358,7 @@ export default function App() {
             startDate,
             endDate,
             timezone: data?.settings.timezone ?? "UTC",
+            model,
           },
           setUsageProgress,
         );
@@ -719,11 +725,26 @@ export default function App() {
               <UsageDashboard
                 platform={platform}
                 timezone={data?.settings.timezone ?? "UTC"}
+                language={language}
                 text={t}
                 loading={usageLoading}
                 progress={usageProgress}
                 report={platformUsage}
+                active={tab === "usage"}
+                refreshIntervalSeconds={
+                  data?.settings.usageRefreshIntervalSeconds ?? 0
+                }
                 onQuery={queryUsage}
+                onRefreshIntervalChange={async (seconds) => {
+                  if (!data) return;
+                  await saveSettings(
+                    {
+                      ...data.settings,
+                      usageRefreshIntervalSeconds: seconds,
+                    },
+                    false,
+                  );
+                }}
                 onCancel={cancelUsage}
               />
             </Suspense>
@@ -736,6 +757,7 @@ export default function App() {
           open={settingsOpen}
           onOpenChange={setSettingsOpen}
           settings={data.settings}
+          historySync={data.historySync}
           language={language}
           busy={busyAction === "settings"}
           onPreviewTheme={applyTheme}
@@ -949,7 +971,7 @@ export default function App() {
               autoFocus
               value={launchCwd}
               onChange={(event) => setLaunchCwd(event.target.value)}
-              placeholder="/Users/name/Code/project"
+              placeholder={t("projectPathPlaceholder")}
             />
           </div>
           <DialogFooter>

@@ -4,6 +4,8 @@ import type {
   BootstrapResponse,
   CreateProviderRequest,
   ImportCurrentRequest,
+  ModelFetchRequest,
+  ModelFetchResponse,
   HistoryApplyRequest,
   HistoryApplyResult,
   HistoryPreview,
@@ -15,8 +17,23 @@ import type {
   UsageQueryRequest,
   UsageReport,
 } from "@/types";
+import { emptyPlatformConfig } from "@/types";
 
 const now = Math.floor(Date.now() / 1_000);
+
+const profileExtras = (
+  platform: ProviderProfile["platform"],
+  model: string | null,
+) => ({
+  customHeaders: [],
+  userAgent: null,
+  platformConfig:
+    platform === "codex"
+      ? { ...emptyPlatformConfig(platform), defaultModel: model }
+      : platform === "claude_code"
+        ? { ...emptyPlatformConfig(platform), defaultModel: model }
+        : { platform, models: model ? [model] : [] },
+});
 
 let state: BootstrapResponse = {
   profiles: [
@@ -28,6 +45,7 @@ let state: BootstrapResponse = {
       accountLabel: "haozi@example.com",
       baseUrl: null,
       model: null,
+      ...profileExtras("codex", null),
       secretKind: "none",
       hasSecret: false,
       profileHome: "/tmp/preview/codex-personal",
@@ -43,6 +61,7 @@ let state: BootstrapResponse = {
       accountLabel: "engineering@acme.dev",
       baseUrl: null,
       model: null,
+      ...profileExtras("codex", null),
       secretKind: "none",
       hasSecret: false,
       profileHome: "/tmp/preview/codex-work",
@@ -58,6 +77,7 @@ let state: BootstrapResponse = {
       accountLabel: "Team API",
       baseUrl: "https://openrouter.ai/api/v1",
       model: "openai/gpt-5.1-codex",
+      ...profileExtras("codex", "openai/gpt-5.1-codex"),
       secretKind: "api_key",
       hasSecret: true,
       profileHome: "/tmp/preview/codex-openrouter",
@@ -73,6 +93,7 @@ let state: BootstrapResponse = {
       accountLabel: "haozi@example.com",
       baseUrl: null,
       model: null,
+      ...profileExtras("claude_code", null),
       secretKind: "none",
       hasSecret: false,
       profileHome: "/tmp/preview/claude-personal",
@@ -88,6 +109,7 @@ let state: BootstrapResponse = {
       accountLabel: "isolated official account",
       baseUrl: null,
       model: null,
+      ...profileExtras("claude_desktop", null),
       secretKind: "none",
       hasSecret: false,
       profileHome: "/tmp/preview/desktop-personal",
@@ -103,6 +125,7 @@ let state: BootstrapResponse = {
       accountLabel: "Anthropic Messages",
       baseUrl: "https://gateway.example.com",
       model: "claude-sonnet-5",
+      ...profileExtras("claude_desktop", "claude-sonnet-5"),
       secretKind: "api_key",
       hasSecret: true,
       profileHome: "/tmp/preview/desktop-gateway",
@@ -116,7 +139,7 @@ let state: BootstrapResponse = {
       platform: "codex",
       cliFound: true,
       cliPath: "/usr/local/bin/codex",
-      cliVersion: "codex-cli 0.146.0",
+      cliVersion: "codex-cli 0.147.0",
       configRoot: "~/.codex",
       binding: {
         platform: "codex",
@@ -128,7 +151,7 @@ let state: BootstrapResponse = {
       platform: "claude_code",
       cliFound: true,
       cliPath: "/usr/local/bin/claude",
-      cliVersion: "Claude Code 2.1.220",
+      cliVersion: "Claude Code 2.1.226",
       configRoot: "~/.claude",
       binding: {
         platform: "claude_code",
@@ -140,7 +163,7 @@ let state: BootstrapResponse = {
       platform: "claude_desktop",
       cliFound: true,
       cliPath: "/Applications/Claude.app/Contents/MacOS/Claude",
-      cliVersion: "1.24012.9",
+      cliVersion: "1.26832.0",
       configRoot: "~/Library/Application Support/Claude",
       binding: {
         platform: "claude_desktop",
@@ -163,7 +186,15 @@ let state: BootstrapResponse = {
     unifyClaudeCodeHistory: false,
     unifyClaudeDesktopCodeHistory: false,
     claudeDesktopHistoryTarget: null,
+    usageRefreshIntervalSeconds: 0,
   },
+  historySync: ["codex", "claude_code", "claude_desktop_code"].map((scope) => ({
+    scope: scope as "codex" | "claude_code" | "claude_desktop_code",
+    state: "idle" as const,
+    processedFiles: 0,
+    lastCompletedAt: null,
+    errorSummary: null,
+  })),
 };
 
 const providerCredentials = new Map<string, string>([
@@ -210,6 +241,10 @@ function profileFromRequest(
     accountLabel: request.accountLabel,
     baseUrl: create?.baseUrl ?? null,
     model: create?.model ?? null,
+    customHeaders: create?.customHeaders ?? [],
+    userAgent: create?.userAgent ?? null,
+    platformConfig:
+      create?.platformConfig ?? emptyPlatformConfig(request.platform),
     secretKind: create?.secretKind ?? "none",
     hasSecret: Boolean(create?.secret),
     profileHome: "/tmp/preview/new-profile",
@@ -269,6 +304,12 @@ function usage(request: UsageQueryRequest): UsageReport {
   );
   return {
     ...request,
+    selectedModel: request.model,
+    availableModels: ["gpt-5.6-sol", "claude-sonnet-5"],
+    cacheHitTokens: totals.cacheRead,
+    cacheHitRate:
+      totals.cacheRead /
+      (totals.uncachedInput + totals.cacheRead + totals.cacheWrite),
     totals,
     requestCount: buckets.reduce((sum, bucket) => sum + bucket.requestCount, 0),
     buckets,
@@ -287,6 +328,7 @@ function usage(request: UsageQueryRequest): UsageReport {
 export const previewApi = {
   operation,
   bootstrap: async () => copy(state),
+  historySyncStatus: async () => copy(state.historySync),
   checkUpdate: async () => null,
   installUpdate: async (
     _onProgress: (progress: UpdateProgress) => void,
@@ -310,6 +352,9 @@ export const previewApi = {
       accountLabel: request.accountLabel,
       baseUrl: request.baseUrl,
       model: request.model,
+      customHeaders: request.customHeaders,
+      userAgent: request.userAgent,
+      platformConfig: request.platformConfig,
       secretKind: request.secretKind,
       hasSecret: profile.hasSecret || Boolean(request.replacementSecret),
     });
@@ -323,6 +368,19 @@ export const previewApi = {
   },
   getProviderCredential: async (id: string) => ({
     credential: providerCredentials.get(id) ?? null,
+  }),
+  fetchProviderModels: async (
+    request: ModelFetchRequest,
+  ): Promise<ModelFetchResponse> => ({
+    models: [
+      request.platform === "codex" ? "gpt-5.6-sol" : "claude-sonnet-5",
+      request.platform === "codex" ? "gpt-5.5-codex" : "claude-opus-5",
+    ].map((id) => ({
+      id,
+      ownedBy: "preview",
+      directCompatible: true,
+      warning: null,
+    })),
   }),
   deleteProvider: async (id: string) => {
     state.profiles = state.profiles.filter((profile) => profile.id !== id);

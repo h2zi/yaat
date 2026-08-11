@@ -1204,7 +1204,8 @@ fn render_toml(source: &str, operations: &[PatchOperation]) -> Result<String, Pa
     for operation in operations {
         match operation {
             PatchOperation::Set { path, value } => {
-                let value = json_to_toml(value, path)?;
+                let value = json_to_toml_item(value, path)?;
+                promote_inline_toml_parents(document.as_item_mut(), path, 0)?;
                 toml_set_item(document.as_item_mut(), path, value, 0)?;
             }
             PatchOperation::Remove { path } => {
@@ -1215,10 +1216,39 @@ fn render_toml(source: &str, operations: &[PatchOperation]) -> Result<String, Pa
     Ok(document.to_string())
 }
 
+fn promote_inline_toml_parents(
+    item: &mut Item,
+    path: &OwnedPath,
+    depth: usize,
+) -> Result<(), PatchError> {
+    if depth + 1 >= path.segments().len() {
+        return Ok(());
+    }
+    let Item::Table(table) = item else {
+        return Ok(());
+    };
+    let segment = &path.segments()[depth];
+    let Some(child) = table.get_mut(segment) else {
+        return Ok(());
+    };
+    if matches!(child, Item::Value(TomlValue::InlineTable(_))) {
+        let Item::Value(TomlValue::InlineTable(inline)) = std::mem::replace(child, Item::None)
+        else {
+            unreachable!();
+        };
+        let mut promoted = Table::new();
+        for (key, value) in inline {
+            promoted.insert(&key, Item::Value(value));
+        }
+        *child = Item::Table(promoted);
+    }
+    promote_inline_toml_parents(child, path, depth + 1)
+}
+
 fn toml_set_item(
     item: &mut Item,
     path: &OwnedPath,
-    new_value: TomlValue,
+    mut new_value: Item,
     depth: usize,
 ) -> Result<(), PatchError> {
     let segment = &path.segments()[depth];
@@ -1227,19 +1257,16 @@ fn toml_set_item(
         Item::Table(table) => {
             if is_leaf {
                 match table.get_mut(segment) {
-                    Some(Item::Value(old_value)) => {
-                        let mut replacement = new_value;
-                        preserve_toml_decor(old_value, &mut replacement);
-                        *old_value = replacement;
-                    }
                     Some(existing) => {
-                        return Err(PatchError::PathTypeConflict {
-                            path: path.clone(),
-                            found: existing.type_name(),
-                        });
+                        if let Item::Value(old_value) = &mut *existing
+                            && let Item::Value(replacement) = &mut new_value
+                        {
+                            preserve_toml_decor(old_value, replacement);
+                        }
+                        *existing = new_value;
                     }
                     None => {
-                        table.insert(segment, Item::Value(new_value));
+                        table.insert(segment, new_value);
                     }
                 }
                 return Ok(());
@@ -1256,7 +1283,8 @@ fn toml_set_item(
             toml_set_item(child, path, new_value, depth + 1)
         }
         Item::Value(TomlValue::InlineTable(table)) => {
-            toml_set_inline(table, path, new_value, depth)
+            let value = item_to_inline_value(new_value, path)?;
+            toml_set_inline(table, path, value, depth)
         }
         existing => Err(PatchError::PathTypeConflict {
             path: prefix_path(path, depth),
@@ -1391,6 +1419,37 @@ fn json_to_toml(value: &JsonValueOwned, path: &OwnedPath) -> Result<TomlValue, P
             }
             Ok(TomlValue::InlineTable(table))
         }
+    }
+}
+
+fn json_to_toml_item(value: &JsonValueOwned, path: &OwnedPath) -> Result<Item, PatchError> {
+    match value {
+        JsonValueOwned::Object(values) => {
+            let mut table = Table::new();
+            for (key, value) in values {
+                table.insert(key, json_to_toml_item(value, path)?);
+            }
+            Ok(Item::Table(table))
+        }
+        _ => json_to_toml(value, path).map(Item::Value),
+    }
+}
+
+fn item_to_inline_value(item: Item, path: &OwnedPath) -> Result<TomlValue, PatchError> {
+    match item {
+        Item::Value(value) => Ok(value),
+        Item::Table(table) => {
+            let mut inline = InlineTable::new();
+            for (key, item) in table {
+                inline.insert(&key, item_to_inline_value(item, path)?);
+            }
+            Ok(TomlValue::InlineTable(inline))
+        }
+        item => Err(PatchError::UnsupportedValue {
+            path: path.clone(),
+            format: ConfigFormat::Toml.name(),
+            reason: item.type_name(),
+        }),
     }
 }
 

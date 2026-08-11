@@ -14,22 +14,30 @@ use serde::Deserialize;
 use toml_edit::{DocumentMut, Item, Table, value};
 use url::Url;
 use uuid::Uuid;
-use yaat_contracts::{Platform, ProviderKind, SecretKind};
+use yaat_contracts::{
+    CodexCatalogModel, HeaderEntry, Platform, ProviderKind, ProviderPlatformConfig,
+    ReasoningEffort, SecretKind,
+};
 use zeroize::{Zeroize, Zeroizing};
 
-use crate::activation::{ConfigFormat, OwnedPath, PatchOperation};
+use crate::activation::{
+    ConfigFormat, OwnedPath, PatchOperation, remove_atomically, replace_atomically,
+};
 
 use super::codex_credentials;
 use super::{
     AdapterContext, CommandSpec, CredentialSnapshot, CredentialState, GlobalConfigPlan,
-    PlatformAdapter, ProfileRuntime,
+    PlatformAdapter, ProfileRuntime, SidecarPlan,
 };
 
 const CODEX_HOME_ENV: &str = "CODEX_HOME";
 #[cfg(test)]
 const AUTH_FILE_NAME: &str = "auth.json";
 const CONFIG_FILE_NAME: &str = "config.toml";
-const MANAGED_PROVIDER_ID: &str = crate::history::CODEX_HISTORY_PROVIDER_ID;
+const CUSTOM_PROVIDER_ID: &str = crate::history::CODEX_HISTORY_PROVIDER_ID;
+#[cfg(test)]
+const MANAGED_PROVIDER_ID: &str = CUSTOM_PROVIDER_ID;
+const LEGACY_MANAGED_PROVIDER_ID: &str = "yaat_managed_v1";
 const CREDENTIAL_STORAGE_KIND: &str = "codex_auth_json_v1";
 const OPENAI_API_BASE_URL: &str = "https://api.openai.com/v1";
 const MAX_CONFIG_BYTES: u64 = 4 * 1024 * 1024;
@@ -51,6 +59,8 @@ pub const OWNED_TOML_PATHS: &[&str] = &[
     "wire_api",
     "experimental_bearer_token",
     "cli_auth_credentials_store",
+    "model_catalog_json",
+    "model_providers.custom",
     "model_providers.yaat_managed_v1",
 ];
 
@@ -166,8 +176,12 @@ impl CodexAdapter {
         Ok(identity)
     }
 
-    fn managed_profile_home(&self, profile_id: &str) -> Result<PathBuf, String> {
-        crate::paths::managed_profile_home(Platform::Codex, profile_id)
+    fn managed_profile_home(
+        &self,
+        context: &AdapterContext,
+        profile_id: &str,
+    ) -> Result<PathBuf, String> {
+        crate::paths::managed_profile_home_at(&context.data_root, Platform::Codex, profile_id)
             .map_err(|error| error.to_string())
     }
 
@@ -175,10 +189,10 @@ impl CodexAdapter {
         &self,
         source: &str,
         runtime: &ProfileRuntime<'_>,
-        helper_executable: &Path,
+        catalog_path: Option<&Path>,
     ) -> Result<String, String> {
-        validate_runtime(runtime, helper_executable)?;
-        derive_profile_config(source, runtime, helper_executable)
+        validate_runtime(runtime)?;
+        derive_profile_config(source, runtime, catalog_path)
     }
 }
 
@@ -194,9 +208,9 @@ impl PlatformAdapter for CodexAdapter {
         context: &AdapterContext,
         runtime: ProfileRuntime<'_>,
     ) -> Result<PathBuf, String> {
-        validate_runtime(&runtime, &context.helper_executable)?;
+        validate_runtime(&runtime)?;
         let source_root = self.config_root(context)?;
-        let profile_home = self.managed_profile_home(&runtime.profile.id)?;
+        let profile_home = self.managed_profile_home(context, &runtime.profile.id)?;
         crate::paths::ensure_private_directory(&profile_home)
             .map_err(|error| format!("failed to create Codex profile home: {error}"))?;
 
@@ -207,8 +221,18 @@ impl PlatformAdapter for CodexAdapter {
         let target_path = profile_home.join(CONFIG_FILE_NAME);
         let source_path = source_root.join(CONFIG_FILE_NAME);
         let base = read_profile_config_base(&source_path, &target_path)?;
-        let derived = self.derive_profile_config(&base, &runtime, &context.helper_executable)?;
-        atomic_write_private(&target_path, derived.as_bytes())?;
+        let (catalog_file, catalog_contents) =
+            model_catalog_plan(&context.data_root, runtime.profile)?;
+        let previous_catalog = read_optional_bytes(&catalog_file, MAX_CONFIG_BYTES)?;
+        apply_sidecar(&catalog_file, catalog_contents.as_deref())?;
+        let catalog_path = catalog_contents.as_ref().map(|_| catalog_file.as_path());
+        let result = self
+            .derive_profile_config(&base, &runtime, catalog_path)
+            .and_then(|derived| atomic_write_private(&target_path, derived.as_bytes()));
+        if let Err(error) = result {
+            restore_sidecar(&catalog_file, previous_catalog.as_deref())?;
+            return Err(error);
+        }
         Ok(profile_home)
     }
 
@@ -220,8 +244,7 @@ impl PlatformAdapter for CodexAdapter {
     ) -> Result<CommandSpec, String> {
         if runtime.profile.kind != ProviderKind::OfficialSubscription {
             return Err(
-                "Codex API-key and third-party profiles use the YAAT credential helper and do not require `codex login`"
-                    .into(),
+                "Codex API-key and third-party profiles do not require `codex login`".into(),
             );
         }
         let profile_home = self.prepare_profile(context, runtime)?;
@@ -320,11 +343,13 @@ impl PlatformAdapter for CodexAdapter {
         context: &AdapterContext,
         runtime: ProfileRuntime<'_>,
     ) -> Result<GlobalConfigPlan, String> {
-        validate_runtime(&runtime, &context.helper_executable)?;
+        validate_runtime(&runtime)?;
         let config_root = self.config_root(context)?;
         ensure_existing_directory(&config_root, "Codex home")?;
 
         let profile = runtime.profile;
+        let (catalog_file, catalog_contents) = model_catalog_plan(&context.data_root, profile)?;
+        let catalog_path = catalog_contents.as_ref().map(|_| catalog_file.as_path());
         let mut operations = Vec::with_capacity(OWNED_TOML_PATHS.len());
         let path = |value: &str| {
             OwnedPath::from_segments(value.split('.')).map_err(|error| error.to_string())
@@ -353,8 +378,13 @@ impl PlatformAdapter for CodexAdapter {
         )?;
         set_or_remove(
             &mut operations,
+            "model_catalog_json",
+            catalog_path.map(|path| serde_json::Value::String(path.to_string_lossy().into_owned())),
+        )?;
+        set_or_remove(
+            &mut operations,
             "model_provider",
-            Some(serde_json::Value::String(MANAGED_PROVIDER_ID.into())),
+            Some(serde_json::Value::String(CUSTOM_PROVIDER_ID.into())),
         )?;
         for key in [
             "profile",
@@ -373,6 +403,10 @@ impl PlatformAdapter for CodexAdapter {
                 provider.insert(
                     "wire_api".into(),
                     serde_json::Value::String("responses".into()),
+                );
+                provider.insert(
+                    "base_url".into(),
+                    serde_json::Value::String(OPENAI_API_BASE_URL.into()),
                 );
                 provider.insert("requires_openai_auth".into(), serde_json::Value::Bool(true));
                 provider.insert("supports_websockets".into(), serde_json::Value::Bool(true));
@@ -421,30 +455,31 @@ impl PlatformAdapter for CodexAdapter {
                         serde_json::Value::Bool(true),
                     );
                 }
-                if profile.secret_kind != SecretKind::None {
-                    let helper = context.helper_executable.to_str().ok_or_else(|| {
-                        "YAAT credential helper path is not valid UTF-8".to_string()
-                    })?;
-                    let secret_ref = runtime
-                        .secret_ref
-                        .ok_or_else(|| "YAAT credential reference is unavailable".to_string())?;
+                if let Some(secret) = runtime.secret {
                     provider.insert(
-                        "auth".into(),
-                        serde_json::json!({
-                            "command": helper,
-                            "args": ["--yaat-credential-helper", "codex", secret_ref]
-                        }),
+                        "experimental_bearer_token".into(),
+                        serde_json::Value::String(secret.to_owned()),
                     );
+                }
+                if let Some(headers) =
+                    codex_headers(&profile.custom_headers, profile.user_agent.as_deref())
+                {
+                    provider.insert("http_headers".into(), headers);
                 }
                 Some(serde_json::Value::Object(provider))
             }
         };
-        set_or_remove(&mut operations, "model_providers.yaat_managed_v1", provider)?;
+        set_or_remove(&mut operations, "model_providers.custom", provider)?;
+        set_or_remove(&mut operations, "model_providers.yaat_managed_v1", None)?;
 
         Ok(GlobalConfigPlan {
             path: config_root.join(CONFIG_FILE_NAME),
             format: ConfigFormat::Toml,
             operations,
+            sidecars: vec![SidecarPlan {
+                path: catalog_file,
+                contents: catalog_contents,
+            }],
         })
     }
 }
@@ -457,7 +492,7 @@ fn read_profile_config_base(source_path: &Path, target_path: &Path) -> Result<St
     }
 }
 
-fn validate_runtime(runtime: &ProfileRuntime<'_>, helper_executable: &Path) -> Result<(), String> {
+fn validate_runtime(runtime: &ProfileRuntime<'_>) -> Result<(), String> {
     let profile = runtime.profile;
     if profile.platform != Platform::Codex {
         return Err("Codex adapter received a profile for another platform".into());
@@ -467,21 +502,19 @@ fn validate_runtime(runtime: &ProfileRuntime<'_>, helper_executable: &Path) -> R
         return Err("Codex profile name must not be empty".into());
     }
 
-    let has_ref = runtime
-        .secret_ref
-        .is_some_and(|value| !value.trim().is_empty());
-    if runtime.secret_ref.is_some_and(|value| {
+    let has_secret = runtime.secret.is_some_and(|value| !value.trim().is_empty());
+    if runtime.secret.is_some_and(|value| {
         value.is_empty()
-            || value.len() > 512
+            || value.len() > 16 * 1024
             || value.contains('\0')
             || value.contains(['\r', '\n'])
     }) {
-        return Err("invalid YAAT credential reference".into());
+        return Err("invalid Codex credential".into());
     }
 
     match profile.kind {
         ProviderKind::OfficialSubscription => {
-            if profile.secret_kind != SecretKind::None || profile.has_secret || has_ref {
+            if profile.secret_kind != SecretKind::None || profile.has_secret || has_secret {
                 return Err(
                     "official Codex subscription profiles must authenticate with isolated `codex login`, not a stored API secret"
                         .into(),
@@ -500,13 +533,10 @@ fn validate_runtime(runtime: &ProfileRuntime<'_>, helper_executable: &Path) -> R
                 profile.secret_kind,
                 SecretKind::ApiKey | SecretKind::BearerToken
             ) || !profile.has_secret
-                || !has_ref
+                || !has_secret
             {
-                return Err(
-                    "official Codex API profiles require a YAAT credential reference".into(),
-                );
+                return Err("official Codex API profiles require a stored credential".into());
             }
-            validate_helper_executable(helper_executable)?;
             validate_base_url(profile.base_url.as_deref().unwrap_or(OPENAI_API_BASE_URL))?;
         }
         ProviderKind::ThirdParty => {
@@ -517,46 +547,16 @@ fn validate_runtime(runtime: &ProfileRuntime<'_>, helper_executable: &Path) -> R
                 .ok_or_else(|| "third-party Codex profiles require base_url".to_string())?;
             validate_base_url(base_url)?;
             match profile.secret_kind {
-                SecretKind::None if profile.has_secret || has_ref => {
-                    return Err("a no-auth Codex profile cannot carry a secret reference".into());
+                SecretKind::None if profile.has_secret || has_secret => {
+                    return Err("a no-auth Codex profile cannot carry a secret".into());
                 }
                 SecretKind::None => {}
-                SecretKind::ApiKey | SecretKind::BearerToken if profile.has_secret && has_ref => {
-                    validate_helper_executable(helper_executable)?;
-                }
+                SecretKind::ApiKey | SecretKind::BearerToken
+                    if profile.has_secret && has_secret => {}
                 SecretKind::ApiKey | SecretKind::BearerToken => {
                     return Err("third-party Codex profile secret is unavailable".into());
                 }
             }
-        }
-    }
-    Ok(())
-}
-
-fn validate_helper_executable(path: &Path) -> Result<(), String> {
-    if !path.is_absolute() {
-        return Err("YAAT credential helper path must be absolute".into());
-    }
-    let metadata = fs::metadata(path).map_err(|error| {
-        format!(
-            "YAAT credential helper {} is unavailable: {error}",
-            path.display()
-        )
-    })?;
-    if !metadata.is_file() {
-        return Err(format!(
-            "YAAT credential helper {} is not a file",
-            path.display()
-        ));
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        if metadata.permissions().mode() & 0o111 == 0 {
-            return Err(format!(
-                "YAAT credential helper {} is not executable",
-                path.display()
-            ));
         }
     }
     Ok(())
@@ -580,7 +580,7 @@ fn validate_base_url(raw: &str) -> Result<String, String> {
 fn derive_profile_config(
     source: &str,
     runtime: &ProfileRuntime<'_>,
-    helper_executable: &Path,
+    catalog_path: Option<&Path>,
 ) -> Result<String, String> {
     let profile = runtime.profile;
     let mut doc = if source.trim().is_empty() {
@@ -590,6 +590,7 @@ fn derive_profile_config(
             .parse::<DocumentMut>()
             .map_err(|error| format!("source Codex config.toml is malformed: {error}"))?
     };
+    promote_model_providers_table(&mut doc)?;
 
     for key in [
         "model",
@@ -601,6 +602,7 @@ fn derive_profile_config(
         "wire_api",
         "experimental_bearer_token",
         "cli_auth_credentials_store",
+        "model_catalog_json",
     ] {
         doc.as_table_mut().remove(key);
     }
@@ -608,7 +610,8 @@ fn derive_profile_config(
         .get_mut("model_providers")
         .and_then(Item::as_table_like_mut)
     {
-        providers.remove(MANAGED_PROVIDER_ID);
+        providers.remove(CUSTOM_PROVIDER_ID);
+        providers.remove(LEGACY_MANAGED_PROVIDER_ID);
     } else if doc.get("model_providers").is_some() {
         return Err("source Codex model_providers must be a table".into());
     }
@@ -625,11 +628,15 @@ fn derive_profile_config(
         doc["model"] = value(model);
     }
 
-    doc["model_provider"] = value(MANAGED_PROVIDER_ID);
+    doc["model_provider"] = value(CUSTOM_PROVIDER_ID);
+    if let Some(path) = catalog_path {
+        doc["model_catalog_json"] = value(path.to_string_lossy().into_owned());
+    }
     match profile.kind {
         ProviderKind::OfficialSubscription => {
             let mut provider = Table::new();
             provider["name"] = value("OpenAI");
+            provider["base_url"] = value(OPENAI_API_BASE_URL);
             provider["wire_api"] = value("responses");
             provider["requires_openai_auth"] = value(true);
             provider["supports_websockets"] = value(true);
@@ -643,7 +650,7 @@ fn derive_profile_config(
                 .get_mut("model_providers")
                 .and_then(Item::as_table_like_mut)
                 .ok_or_else(|| "source Codex model_providers must be a table".to_string())?;
-            providers.insert(MANAGED_PROVIDER_ID, Item::Table(provider));
+            providers.insert(CUSTOM_PROVIDER_ID, Item::Table(provider));
         }
         ProviderKind::OfficialApi | ProviderKind::ThirdParty => {
             let base_url = match profile.kind {
@@ -672,22 +679,16 @@ fn derive_profile_config(
                 provider["supports_standalone_web_search"] = value(true);
             }
 
-            if profile.secret_kind != SecretKind::None {
-                let helper = helper_executable.to_str().ok_or_else(|| {
-                    "YAAT credential helper path is not valid UTF-8 and cannot be written to Codex TOML"
-                        .to_string()
-                })?;
-                let secret_ref = runtime
-                    .secret_ref
-                    .ok_or_else(|| "YAAT credential reference is unavailable".to_string())?;
-                let mut auth = Table::new();
-                auth["command"] = value(helper);
-                let mut args = toml_edit::Array::new();
-                args.push("--yaat-credential-helper");
-                args.push("codex");
-                args.push(secret_ref);
-                auth["args"] = value(args);
-                provider["auth"] = Item::Table(auth);
+            if let Some(secret) = runtime.secret {
+                provider["experimental_bearer_token"] = value(secret);
+            }
+            let headers = merged_headers(&profile.custom_headers, profile.user_agent.as_deref());
+            if !headers.is_empty() {
+                let mut table = Table::new();
+                for (name, value_text) in headers {
+                    table[&name] = value(value_text);
+                }
+                provider["http_headers"] = Item::Table(table);
             }
 
             if doc.get("model_providers").is_none() {
@@ -699,11 +700,174 @@ fn derive_profile_config(
                 .get_mut("model_providers")
                 .and_then(Item::as_table_like_mut)
                 .ok_or_else(|| "source Codex model_providers must be a table".to_string())?;
-            providers.insert(MANAGED_PROVIDER_ID, Item::Table(provider));
+            providers.insert(CUSTOM_PROVIDER_ID, Item::Table(provider));
         }
     }
 
     Ok(doc.to_string())
+}
+
+fn promote_model_providers_table(doc: &mut DocumentMut) -> Result<(), String> {
+    let Some(item) = doc.get_mut("model_providers") else {
+        return Ok(());
+    };
+    if matches!(item, Item::Value(toml_edit::Value::InlineTable(_))) {
+        let Item::Value(toml_edit::Value::InlineTable(inline)) =
+            std::mem::replace(item, Item::None)
+        else {
+            unreachable!();
+        };
+        let mut table = Table::new();
+        for (key, value) in inline {
+            table.insert(&key, Item::Value(value));
+        }
+        *item = Item::Table(table);
+    }
+    if item.as_table_like().is_none() {
+        return Err("source Codex model_providers must be a table".into());
+    }
+    Ok(())
+}
+
+fn merged_headers(headers: &[HeaderEntry], user_agent: Option<&str>) -> BTreeMap<String, String> {
+    let mut merged = headers
+        .iter()
+        .map(|entry| (entry.name.clone(), entry.value.clone()))
+        .collect::<BTreeMap<_, _>>();
+    if let Some(value) = user_agent.filter(|value| !value.trim().is_empty()) {
+        merged.insert("User-Agent".into(), value.trim().into());
+    }
+    merged
+}
+
+fn codex_headers(headers: &[HeaderEntry], user_agent: Option<&str>) -> Option<serde_json::Value> {
+    let merged = merged_headers(headers, user_agent);
+    (!merged.is_empty()).then(|| serde_json::to_value(merged).expect("header map serializes"))
+}
+
+fn model_catalog_plan(
+    data_root: &Path,
+    profile: &yaat_contracts::ProviderProfile,
+) -> Result<(PathBuf, Option<Vec<u8>>), String> {
+    let ProviderPlatformConfig::Codex { catalog, .. } = &profile.platform_config else {
+        return Err("Codex profile has mismatched platform config".into());
+    };
+    let path = crate::paths::codex_catalog_path_at(data_root, &profile.id)
+        .map_err(|error| error.to_string())?;
+    if catalog.is_empty() {
+        return Ok((path, None));
+    }
+    let value = serde_json::json!({
+        "models": catalog
+            .iter()
+            .enumerate()
+            .map(|(index, model)| catalog_model(model, index))
+            .collect::<Vec<_>>()
+    });
+    let mut bytes = serde_json::to_vec_pretty(&value).map_err(|error| error.to_string())?;
+    bytes.push(b'\n');
+    Ok((path, Some(bytes)))
+}
+
+fn apply_sidecar(path: &Path, contents: Option<&[u8]>) -> Result<(), String> {
+    match contents {
+        Some(contents) => {
+            let parent = path
+                .parent()
+                .ok_or_else(|| "Codex catalog path has no parent".to_string())?;
+            crate::paths::ensure_private_directory(parent).map_err(|error| error.to_string())?;
+            replace_atomically(path, contents).map_err(|error| error.to_string())?;
+            crate::paths::ensure_private_file(path).map_err(|error| error.to_string())
+        }
+        None => remove_atomically(path).map_err(|error| error.to_string()),
+    }
+}
+
+fn restore_sidecar(path: &Path, contents: Option<&[u8]>) -> Result<(), String> {
+    apply_sidecar(path, contents)
+}
+
+fn read_optional_bytes(path: &Path, maximum: u64) -> Result<Option<Vec<u8>>, String> {
+    match fs::metadata(path) {
+        Ok(metadata) if metadata.is_file() && metadata.len() <= maximum => {
+            fs::read(path).map(Some).map_err(|error| error.to_string())
+        }
+        Ok(metadata) if !metadata.is_file() => Err(format!(
+            "refusing non-regular sidecar file {}",
+            path.display()
+        )),
+        Ok(_) => Err(format!("sidecar file is too large: {}", path.display())),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error.to_string()),
+    }
+}
+
+fn catalog_model(model: &CodexCatalogModel, index: usize) -> serde_json::Value {
+    let reasoning = model
+        .supported_reasoning_efforts
+        .iter()
+        .map(|effort| {
+            serde_json::json!({
+                "effort": effort,
+                "description": reasoning_description(*effort),
+            })
+        })
+        .collect::<Vec<_>>();
+    let modalities = if model.supports_image_input {
+        vec!["text", "image"]
+    } else {
+        vec!["text"]
+    };
+    serde_json::json!({
+        "slug": model.id,
+        "display_name": model.display_name,
+        "description": model.description,
+        "default_reasoning_level": model.default_reasoning_effort,
+        "supported_reasoning_levels": reasoning,
+        "shell_type": "shell_command",
+        "visibility": "list",
+        "supported_in_api": true,
+        "priority": i32::try_from(index + 1).unwrap_or(i32::MAX),
+        "additional_speed_tiers": [],
+        "service_tiers": [],
+        "availability_nux": null,
+        "upgrade": null,
+        "base_instructions": "You are a coding assistant.",
+        "model_messages": null,
+        "include_skills_usage_instructions": false,
+        "include_plugin_usage_instructions": false,
+        "include_apps_usage_instructions": false,
+        "supports_reasoning_summary_parameter": model.supports_reasoning_summaries,
+        "supports_reasoning_summaries": model.supports_reasoning_summaries,
+        "default_reasoning_summary": if model.supports_reasoning_summaries { "auto" } else { "none" },
+        "support_verbosity": model.supports_verbosity,
+        "default_verbosity": if model.supports_verbosity { Some("medium") } else { None },
+        "apply_patch_tool_type": null,
+        "web_search_tool_type": if model.supports_search_tool && model.supports_image_input { "text_and_image" } else { "text" },
+        "truncation_policy": { "mode": "tokens", "limit": 10000 },
+        "supports_parallel_tool_calls": model.supports_parallel_tool_calls,
+        "supports_image_detail_original": model.supports_image_original,
+        "context_window": model.context_window,
+        "max_context_window": model.context_window,
+        "effective_context_window_percent": 95,
+        "experimental_supported_tools": [],
+        "input_modalities": modalities,
+        "supports_search_tool": model.supports_search_tool,
+        "use_responses_lite": false,
+    })
+}
+
+const fn reasoning_description(effort: ReasoningEffort) -> &'static str {
+    match effort {
+        ReasoningEffort::None => "No reasoning",
+        ReasoningEffort::Minimal => "Minimal reasoning",
+        ReasoningEffort::Low => "Fast responses with lighter reasoning",
+        ReasoningEffort::Medium => "Balanced reasoning depth and latency",
+        ReasoningEffort::High => "Greater reasoning depth",
+        ReasoningEffort::Xhigh => "Extra high reasoning depth",
+        ReasoningEffort::Max => "Maximum reasoning depth",
+        ReasoningEffort::Ultra => "Maximum reasoning with delegation",
+    }
 }
 
 fn codex_command_spec(
@@ -1086,6 +1250,7 @@ fn sync_parent_directory(_parent: &Path) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use std::fs;
+    use std::process::Command;
 
     use base64::Engine;
     use pretty_assertions::assert_eq;
@@ -1109,6 +1274,12 @@ mod tests {
                 ProviderKind::ThirdParty => Some("https://gateway.example/v1/".into()),
             },
             model: Some("gpt-example".into()),
+            custom_headers: Vec::new(),
+            user_agent: None,
+            platform_config: ProviderPlatformConfig::Codex {
+                default_model: Some("gpt-example".into()),
+                catalog: Vec::new(),
+            },
             secret_kind,
             has_secret: secret_kind != SecretKind::None,
             profile_home: None,
@@ -1116,17 +1287,6 @@ mod tests {
             created_at: 0,
             updated_at: 0,
         }
-    }
-
-    fn helper_file(temp: &TempDir) -> PathBuf {
-        let path = temp.path().join("yaat-helper");
-        fs::write(&path, "helper").unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
-        }
-        path
     }
 
     fn fake_chatgpt_auth(email: &str, account_id: &str) -> Vec<u8> {
@@ -1155,8 +1315,7 @@ mod tests {
 
     fn context(temp: &TempDir) -> AdapterContext {
         AdapterContext {
-            app_data_dir: temp.path().join("app-data"),
-            helper_executable: helper_file(temp),
+            data_root: temp.path().join("data"),
             explicit_cli_path: None,
             explicit_config_root: None,
         }
@@ -1191,8 +1350,7 @@ wire_api = "responses"
         fs::write(root.join(CONFIG_FILE_NAME), source).unwrap();
         let profile = profile(ProviderKind::OfficialSubscription, SecretKind::None);
         let context = AdapterContext {
-            app_data_dir: temp.path().join("data"),
-            helper_executable: helper_file(&temp),
+            data_root: temp.path().join("data"),
             explicit_cli_path: None,
             explicit_config_root: Some(root.clone()),
         };
@@ -1202,7 +1360,7 @@ wire_api = "responses"
                 &context,
                 ProfileRuntime {
                     profile: &profile,
-                    secret_ref: None,
+                    secret: None,
                 },
             )
             .unwrap();
@@ -1213,7 +1371,8 @@ wire_api = "responses"
         assert!(after.contains("approval_policy = \"never\""));
         assert!(after.contains("[mcp_servers.files]"));
         assert!(after.contains("[model_providers.personal]"));
-        assert!(after.contains("model_provider = \"yaat_managed_v1\""));
+        assert!(after.contains("model_provider = \"custom\""));
+        assert!(after.contains("[model_providers.custom]"));
         let parsed = after.parse::<DocumentMut>().unwrap();
         assert_eq!(
             parsed["model_providers"][MANAGED_PROVIDER_ID]["requires_openai_auth"].as_bool(),
@@ -1231,8 +1390,66 @@ wire_api = "responses"
                 "/model",
                 "/model_provider",
                 "/openai_base_url",
-                "/model_providers/yaat_managed_v1"
+                "/model_providers/custom"
             ]
+        );
+    }
+
+    #[test]
+    fn current_codex_cli_accepts_generated_catalog_schema_when_available() {
+        let Ok(codex) = which::which("codex") else {
+            return;
+        };
+        let version = Command::new(&codex).arg("--version").output().unwrap();
+        if !String::from_utf8_lossy(&version.stdout).contains("0.147.0") {
+            return;
+        }
+        let temp = TempDir::new().unwrap();
+        let catalog_path = temp.path().join("catalog.json");
+        let model = CodexCatalogModel {
+            id: "yaat-schema-smoke".into(),
+            display_name: "YAAT schema smoke".into(),
+            description: "Generated test model".into(),
+            context_window: 128_000,
+            supported_reasoning_efforts: vec![
+                ReasoningEffort::Low,
+                ReasoningEffort::Medium,
+                ReasoningEffort::High,
+            ],
+            default_reasoning_effort: ReasoningEffort::Medium,
+            supports_image_input: true,
+            supports_image_original: true,
+            supports_parallel_tool_calls: true,
+            supports_reasoning_summaries: true,
+            supports_search_tool: true,
+            supports_verbosity: true,
+        };
+        fs::write(
+            &catalog_path,
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "models": [catalog_model(&model, 0)]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let override_value = format!(
+            "model_catalog_json={}",
+            serde_json::to_string(&catalog_path.to_string_lossy()).unwrap()
+        );
+        let output = Command::new(codex)
+            .args(["debug", "models", "-c", &override_value])
+            .env("CODEX_HOME", temp.path())
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "Codex rejected the generated catalog: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let catalog: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert!(
+            catalog.to_string().contains("yaat-schema-smoke"),
+            "Codex output did not contain the generated model: {catalog}"
         );
     }
 
@@ -1254,13 +1471,12 @@ name = "Personal"
 base_url = "https://personal.example/v1"
 wire_api = "responses"
 "#;
-        let temp = TempDir::new().unwrap();
         let profile = profile(ProviderKind::OfficialSubscription, SecretKind::None);
         let runtime = ProfileRuntime {
             profile: &profile,
-            secret_ref: None,
+            secret: None,
         };
-        let derived = derive_profile_config(source, &runtime, &helper_file(&temp)).unwrap();
+        let derived = derive_profile_config(source, &runtime, None).unwrap();
         let doc = derived.parse::<DocumentMut>().unwrap();
 
         assert_eq!(doc["approval_policy"].as_str(), Some("on-request"));
@@ -1300,18 +1516,16 @@ wire_api = "responses"
     }
 
     #[test]
-    fn third_party_derivation_uses_native_responses_command_auth() {
+    fn third_party_derivation_uses_native_responses_direct_bearer() {
         let source = r#"sandbox_mode = "workspace-write"
 model_providers = { personal = { name = "Personal", base_url = "https://personal.example/v1", wire_api = "responses" } }
 "#;
-        let temp = TempDir::new().unwrap();
-        let helper = helper_file(&temp);
         let profile = profile(ProviderKind::ThirdParty, SecretKind::BearerToken);
         let runtime = ProfileRuntime {
             profile: &profile,
-            secret_ref: Some("credential-ref-123"),
+            secret: Some("test-secret-123"),
         };
-        let derived = derive_profile_config(source, &runtime, &helper).unwrap();
+        let derived = derive_profile_config(source, &runtime, None).unwrap();
         let doc = derived.parse::<DocumentMut>().unwrap();
         let managed = &doc["model_providers"][MANAGED_PROVIDER_ID];
 
@@ -1323,30 +1537,23 @@ model_providers = { personal = { name = "Personal", base_url = "https://personal
         );
         assert_eq!(managed["wire_api"].as_str(), Some("responses"));
         assert_eq!(managed["requires_openai_auth"].as_bool(), Some(false));
-        assert_eq!(managed["auth"]["command"].as_str(), helper.to_str());
         assert_eq!(
-            managed["auth"]["args"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .filter_map(|value| value.as_str())
-                .collect::<Vec<_>>(),
-            vec!["--yaat-credential-helper", "codex", "credential-ref-123"]
+            managed["experimental_bearer_token"].as_str(),
+            Some("test-secret-123")
         );
+        assert!(managed.get("auth").is_none());
+        assert!(derived.contains("[model_providers.custom]"));
         assert!(derived.contains("personal"));
-        assert!(!derived.contains("access-secret"));
-        assert!(!derived.contains("refresh-secret"));
     }
 
     #[test]
     fn no_auth_third_party_omits_auth_table() {
-        let temp = TempDir::new().unwrap();
         let profile = profile(ProviderKind::ThirdParty, SecretKind::None);
         let runtime = ProfileRuntime {
             profile: &profile,
-            secret_ref: None,
+            secret: None,
         };
-        let derived = derive_profile_config("", &runtime, &helper_file(&temp)).unwrap();
+        let derived = derive_profile_config("", &runtime, None).unwrap();
         let doc = derived.parse::<DocumentMut>().unwrap();
         assert!(
             doc["model_providers"][MANAGED_PROVIDER_ID]
@@ -1357,16 +1564,15 @@ model_providers = { personal = { name = "Personal", base_url = "https://personal
 
     #[test]
     fn malformed_model_providers_fails_closed() {
-        let temp = TempDir::new().unwrap();
         let profile = profile(ProviderKind::OfficialSubscription, SecretKind::None);
         let runtime = ProfileRuntime {
             profile: &profile,
-            secret_ref: None,
+            secret: None,
         };
         let error = derive_profile_config(
             "model_providers = 42\napproval_policy = \"never\"\n",
             &runtime,
-            &helper_file(&temp),
+            None,
         )
         .unwrap_err();
         assert!(error.contains("model_providers must be a table"));

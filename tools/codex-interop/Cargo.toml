@@ -26,3 +26,6 @@ uuid = { version = "=1.24.0", features = ["v4"] }
 which = "=8.0.5"
 yaat-contracts = { path = "../../crates/yaat-contracts" }
 zeroize = { version = "=1.8.2", features = ["derive"] }
+
+[dev-dependencies]
+pretty_assertions = "=1.4.1"

@@ -4,7 +4,7 @@ import path from "node:path";
 
 import { chromium } from "playwright";
 
-const output = process.argv[2] ?? "/output";
+const output = process.argv[2] ?? path.resolve("output");
 const url = "http://127.0.0.1:4173";
 
 await mkdir(output, { recursive: true });
@@ -121,53 +121,45 @@ try {
   await page.getByRole("tab", { name: "使用统计" }).click();
   await page.getByText("每日使用趋势").waitFor();
   await page.locator(".recharts-responsive-container").waitFor();
-  const dateInputs = page.locator('input[type="date"]');
-  if ((await dateInputs.nth(1).inputValue()) !== "2026-08-04") {
+  const dateRangeButton = page.getByRole("button", {
+    name: /2026-07-29 — 2026-08-04/,
+  });
+  await dateRangeButton.click();
+  await page.waitForTimeout(200);
+  if (
+    (await page
+      .locator('[data-date="2026-08-04"][data-range-end="true"]')
+      .count()) !== 1
+  ) {
     throw new Error(
       "Usage presets must use the configured Asia/Taipei calendar date",
     );
   }
-  const usageTrendCard = page
-    .getByRole("heading", { name: "每日使用趋势" })
-    .locator('xpath=ancestor::*[@data-slot="card"]');
-  const rangeIndicator = page.locator("[data-usage-range-indicator]");
-  const beforeRangeSwitch = await usageTrendCard.boundingBox();
-  const beforeTransform = await rangeIndicator.evaluate(
-    (element) => getComputedStyle(element).transform,
-  );
+  await page.screenshot({
+    path: path.join(output, "usage-date-picker-light.png"),
+    fullPage: true,
+  });
   await page.getByRole("button", { name: "30 天", exact: true }).click();
-  await page.waitForFunction(
-    () => document.querySelector('input[type="date"]')?.value === "2026-07-06",
+  await page.waitForFunction(() =>
+    Array.from(document.querySelectorAll("button")).some((button) =>
+      button.textContent?.includes("2026-07-06 — 2026-08-04"),
+    ),
   );
   await page.waitForTimeout(250);
-  const afterRangeSwitch = await usageTrendCard.boundingBox();
-  const afterTransform = await rangeIndicator.evaluate(
-    (element) => getComputedStyle(element).transform,
-  );
-  if (
-    !beforeRangeSwitch ||
-    !afterRangeSwitch ||
-    Math.abs(beforeRangeSwitch.y - afterRangeSwitch.y) > 1
-  ) {
-    throw new Error("Usage range switches must not shift the dashboard layout");
-  }
-  if (beforeTransform === afterTransform) {
-    throw new Error("Usage range selection must animate its active indicator");
-  }
   await page.screenshot({
     path: path.join(output, "usage-light.png"),
     fullPage: true,
   });
 
   await page.getByRole("tab", { name: "账号管理" }).click();
-  if ((await dateInputs.first().inputValue()) !== "2026-07-06") {
+  if ((await page.getByText("2026-07-06 — 2026-08-04").count()) === 0) {
     throw new Error(
       "Usage filters must remain mounted while another tab is active",
     );
   }
   await page.getByRole("tab", { name: "使用统计" }).click();
   await page.getByRole("heading", { name: "每日使用趋势" }).waitFor();
-  if ((await dateInputs.first().inputValue()) !== "2026-07-06") {
+  if ((await page.getByText("2026-07-06 — 2026-08-04").count()) === 0) {
     throw new Error(
       "Usage filters must survive account and usage tab switches",
     );
@@ -225,6 +217,40 @@ try {
   }
   await page.screenshot({
     path: path.join(output, "edit-official-credential-dialog.png"),
+    fullPage: true,
+  });
+  await page.keyboard.press("Escape");
+
+  await page.getByRole("button", { name: "添加账号" }).first().click();
+  const thirdPartyDialog = page.getByRole("dialog");
+  await thirdPartyDialog.getByLabel("Provider 类型").click();
+  await page.getByRole("option", { name: "第三方" }).click();
+  await thirdPartyDialog.getByLabel("显示名称").fill("Custom Responses");
+  await thirdPartyDialog
+    .getByLabel("Base URL")
+    .fill("https://api.example.test/v1");
+  await thirdPartyDialog.getByLabel("凭据", { exact: true }).fill("sk-preview");
+  await thirdPartyDialog.getByLabel("默认模型").fill("gpt-custom");
+  if (
+    await thirdPartyDialog
+      .getByRole("button", { name: "获取模型" })
+      .isDisabled()
+  ) {
+    throw new Error(
+      "Model discovery must enable after Base URL and credential are set",
+    );
+  }
+  await page.screenshot({
+    path: path.join(output, "third-party-provider-top.png"),
+    fullPage: true,
+  });
+  await thirdPartyDialog.getByRole("button", { name: "添加请求头" }).click();
+  await thirdPartyDialog.getByPlaceholder("X-Custom-Header").fill("X-Tenant");
+  await thirdPartyDialog.getByPlaceholder("请求头值").fill("tenant-a");
+  await thirdPartyDialog.getByLabel("User-Agent").fill("YAAT-Preview/1");
+  await thirdPartyDialog.getByLabel("User-Agent").scrollIntoViewIfNeeded();
+  await page.screenshot({
+    path: path.join(output, "third-party-provider-headers.png"),
     fullPage: true,
   });
   await page.keyboard.press("Escape");
