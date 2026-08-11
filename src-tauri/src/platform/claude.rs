@@ -69,9 +69,13 @@ const OWNED_SETTINGS_PATHS: &[&str] = &[
     "/env/ANTHROPIC_BASE_URL",
     "/env/ANTHROPIC_MODEL",
     "/env/ANTHROPIC_DEFAULT_SONNET_MODEL",
+    "/env/ANTHROPIC_DEFAULT_SONNET_MODEL_NAME",
     "/env/ANTHROPIC_DEFAULT_OPUS_MODEL",
+    "/env/ANTHROPIC_DEFAULT_OPUS_MODEL_NAME",
     "/env/ANTHROPIC_DEFAULT_HAIKU_MODEL",
+    "/env/ANTHROPIC_DEFAULT_HAIKU_MODEL_NAME",
     "/env/ANTHROPIC_DEFAULT_FABLE_MODEL",
+    "/env/ANTHROPIC_DEFAULT_FABLE_MODEL_NAME",
     "/env/CLAUDE_CODE_SUBAGENT_MODEL",
     "/env/ANTHROPIC_CUSTOM_HEADERS",
     "/env/CLAUDE_CODE_OAUTH_TOKEN",
@@ -89,9 +93,13 @@ const OWNED_ENV_KEYS: &[&str] = &[
     "ANTHROPIC_BASE_URL",
     "ANTHROPIC_MODEL",
     "ANTHROPIC_DEFAULT_SONNET_MODEL",
+    "ANTHROPIC_DEFAULT_SONNET_MODEL_NAME",
     "ANTHROPIC_DEFAULT_OPUS_MODEL",
+    "ANTHROPIC_DEFAULT_OPUS_MODEL_NAME",
     "ANTHROPIC_DEFAULT_HAIKU_MODEL",
+    "ANTHROPIC_DEFAULT_HAIKU_MODEL_NAME",
     "ANTHROPIC_DEFAULT_FABLE_MODEL",
+    "ANTHROPIC_DEFAULT_FABLE_MODEL_NAME",
     "CLAUDE_CODE_SUBAGENT_MODEL",
     "ANTHROPIC_CUSTOM_HEADERS",
     "CLAUDE_CODE_OAUTH_TOKEN",
@@ -110,6 +118,15 @@ const COMPETING_PROVIDER_ENV: &[&str] = &[
     "ANTHROPIC_AUTH_TOKEN",
     "ANTHROPIC_BASE_URL",
     "ANTHROPIC_MODEL",
+    "ANTHROPIC_DEFAULT_SONNET_MODEL",
+    "ANTHROPIC_DEFAULT_SONNET_MODEL_NAME",
+    "ANTHROPIC_DEFAULT_OPUS_MODEL",
+    "ANTHROPIC_DEFAULT_OPUS_MODEL_NAME",
+    "ANTHROPIC_DEFAULT_HAIKU_MODEL",
+    "ANTHROPIC_DEFAULT_HAIKU_MODEL_NAME",
+    "ANTHROPIC_DEFAULT_FABLE_MODEL",
+    "ANTHROPIC_DEFAULT_FABLE_MODEL_NAME",
+    "CLAUDE_CODE_SUBAGENT_MODEL",
     "ANTHROPIC_BEDROCK_BASE_URL",
     "ANTHROPIC_BEDROCK_MANTLE_BASE_URL",
     "ANTHROPIC_CUSTOM_HEADERS",
@@ -504,10 +521,15 @@ impl PlatformAdapter for ClaudeAdapter {
                 "/env/ANTHROPIC_AUTH_TOKEN" => desired.auth_token.as_ref(),
                 "/env/ANTHROPIC_BASE_URL" => desired.base_url.as_ref(),
                 "/env/ANTHROPIC_MODEL" => desired.model.as_ref(),
-                "/env/ANTHROPIC_DEFAULT_SONNET_MODEL" => desired.sonnet.as_ref(),
-                "/env/ANTHROPIC_DEFAULT_OPUS_MODEL" => desired.opus.as_ref(),
-                "/env/ANTHROPIC_DEFAULT_HAIKU_MODEL" => desired.haiku.as_ref(),
-                "/env/ANTHROPIC_DEFAULT_FABLE_MODEL" => desired.fable.as_ref(),
+                "/env/ANTHROPIC_DEFAULT_SONNET_MODEL"
+                | "/env/ANTHROPIC_DEFAULT_SONNET_MODEL_NAME" => desired.sonnet.as_ref(),
+                "/env/ANTHROPIC_DEFAULT_OPUS_MODEL" | "/env/ANTHROPIC_DEFAULT_OPUS_MODEL_NAME" => {
+                    desired.opus.as_ref()
+                }
+                "/env/ANTHROPIC_DEFAULT_HAIKU_MODEL"
+                | "/env/ANTHROPIC_DEFAULT_HAIKU_MODEL_NAME" => desired.haiku.as_ref(),
+                "/env/ANTHROPIC_DEFAULT_FABLE_MODEL"
+                | "/env/ANTHROPIC_DEFAULT_FABLE_MODEL_NAME" => desired.fable.as_ref(),
                 "/env/CLAUDE_CODE_SUBAGENT_MODEL" => desired.subagent.as_ref(),
                 "/env/ANTHROPIC_CUSTOM_HEADERS" => desired.custom_headers.as_ref(),
                 _ => None,
@@ -577,10 +599,18 @@ fn patch_managed_settings(raw: &str, desired: &DesiredSettings) -> Result<String
                 "ANTHROPIC_MODEL" => desired.model.as_deref(),
                 "ANTHROPIC_API_KEY" => desired.api_key.as_deref(),
                 "ANTHROPIC_AUTH_TOKEN" => desired.auth_token.as_deref(),
-                "ANTHROPIC_DEFAULT_SONNET_MODEL" => desired.sonnet.as_deref(),
-                "ANTHROPIC_DEFAULT_OPUS_MODEL" => desired.opus.as_deref(),
-                "ANTHROPIC_DEFAULT_HAIKU_MODEL" => desired.haiku.as_deref(),
-                "ANTHROPIC_DEFAULT_FABLE_MODEL" => desired.fable.as_deref(),
+                "ANTHROPIC_DEFAULT_SONNET_MODEL" | "ANTHROPIC_DEFAULT_SONNET_MODEL_NAME" => {
+                    desired.sonnet.as_deref()
+                }
+                "ANTHROPIC_DEFAULT_OPUS_MODEL" | "ANTHROPIC_DEFAULT_OPUS_MODEL_NAME" => {
+                    desired.opus.as_deref()
+                }
+                "ANTHROPIC_DEFAULT_HAIKU_MODEL" | "ANTHROPIC_DEFAULT_HAIKU_MODEL_NAME" => {
+                    desired.haiku.as_deref()
+                }
+                "ANTHROPIC_DEFAULT_FABLE_MODEL" | "ANTHROPIC_DEFAULT_FABLE_MODEL_NAME" => {
+                    desired.fable.as_deref()
+                }
                 "CLAUDE_CODE_SUBAGENT_MODEL" => desired.subagent.as_deref(),
                 "ANTHROPIC_CUSTOM_HEADERS" => desired.custom_headers.as_deref(),
                 _ => None,
@@ -2477,6 +2507,10 @@ mod tests {
   "permissions": { "allow": ["Read"] },
   "env": {
     "ANTHROPIC_AUTH_TOKEN": "old",
+    "ANTHROPIC_DEFAULT_SONNET_MODEL_NAME": "old-sonnet",
+    "ANTHROPIC_DEFAULT_OPUS_MODEL_NAME": "old-opus",
+    "ANTHROPIC_DEFAULT_HAIKU_MODEL_NAME": "old-haiku",
+    "ANTHROPIC_DEFAULT_FABLE_MODEL_NAME": "old-fable",
     "EDITOR": "vim"
   },
   "enabledPlugins": { "x@y": true }
@@ -2508,6 +2542,68 @@ mod tests {
         assert!(after.contains(r#""enabledPlugins": { "x@y": true }"#));
         assert!(!after.contains("apiKeyHelper"));
         assert!(!after.contains("ANTHROPIC_AUTH_TOKEN"));
+        for key in [
+            "ANTHROPIC_DEFAULT_SONNET_MODEL_NAME",
+            "ANTHROPIC_DEFAULT_OPUS_MODEL_NAME",
+            "ANTHROPIC_DEFAULT_HAIKU_MODEL_NAME",
+            "ANTHROPIC_DEFAULT_FABLE_MODEL_NAME",
+        ] {
+            assert!(!after.contains(key));
+        }
+    }
+
+    #[test]
+    fn global_provider_plan_writes_role_model_ids_and_names_together() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("claude-home");
+        fs::create_dir(&root).unwrap();
+        fs::write(
+            root.join(SETTINGS_FILE_NAME),
+            r#"{"env":{"KEEP_ME":"yes"}}"#,
+        )
+        .unwrap();
+
+        let mut profile = profile(ProviderKind::ThirdParty);
+        profile.base_url = Some("https://gateway.example.com".into());
+        profile.model = Some("upstream-default".into());
+        profile.platform_config = ProviderPlatformConfig::ClaudeCode {
+            default_model: Some("upstream-default".into()),
+            sonnet: Some("upstream-sonnet".into()),
+            opus: Some("upstream-opus".into()),
+            haiku: Some("upstream-haiku".into()),
+            fable: Some("upstream-fable".into()),
+            subagent: Some("upstream-subagent".into()),
+        };
+        let context = AdapterContext {
+            data_root: temp.path().join("data"),
+            explicit_cli_path: None,
+            explicit_config_root: Some(root),
+        };
+
+        let plan = ClaudeAdapter
+            .global_config_plan(
+                &context,
+                ProfileRuntime {
+                    profile: &profile,
+                    secret: Some("secret"),
+                },
+            )
+            .unwrap();
+        PatchEngine::apply_file(&plan.path, plan.format, plan.operations).unwrap();
+        let patched: Value =
+            serde_json::from_str(&fs::read_to_string(&plan.path).unwrap()).unwrap();
+        let env = patched["env"].as_object().unwrap();
+
+        for (role, model) in [
+            ("SONNET", "upstream-sonnet"),
+            ("OPUS", "upstream-opus"),
+            ("HAIKU", "upstream-haiku"),
+            ("FABLE", "upstream-fable"),
+        ] {
+            assert_eq!(env[&format!("ANTHROPIC_DEFAULT_{role}_MODEL")], model);
+            assert_eq!(env[&format!("ANTHROPIC_DEFAULT_{role}_MODEL_NAME")], model);
+        }
+        assert_eq!(env["KEEP_ME"], "yes");
     }
 
     #[test]
@@ -2517,6 +2613,10 @@ mod tests {
   "env": {
     "ANTHROPIC_AUTH_TOKEN": "old token",
     "ANTHROPIC_MODEL": "old-model",
+    "ANTHROPIC_DEFAULT_SONNET_MODEL_NAME": "old-sonnet",
+    "ANTHROPIC_DEFAULT_OPUS_MODEL_NAME": "old-opus",
+    "ANTHROPIC_DEFAULT_HAIKU_MODEL_NAME": "old-haiku",
+    "ANTHROPIC_DEFAULT_FABLE_MODEL_NAME": "old-fable",
     "EDITOR": "vim"
   },
   "theme": "dark"
@@ -2534,8 +2634,44 @@ mod tests {
         assert!(!patched.contains("apiKeyHelper"));
         assert!(!patched.contains("ANTHROPIC_AUTH_TOKEN"));
         assert!(!patched.contains("ANTHROPIC_MODEL"));
+        for key in [
+            "ANTHROPIC_DEFAULT_SONNET_MODEL_NAME",
+            "ANTHROPIC_DEFAULT_OPUS_MODEL_NAME",
+            "ANTHROPIC_DEFAULT_HAIKU_MODEL_NAME",
+            "ANTHROPIC_DEFAULT_FABLE_MODEL_NAME",
+        ] {
+            assert!(!patched.contains(key));
+        }
         assert!(patched.contains(r#""EDITOR": "vim""#));
         assert!(patched.contains(r#""theme": "dark""#));
+    }
+
+    #[test]
+    fn provider_patch_writes_role_model_ids_and_names_together() {
+        let patched = patch_managed_settings(
+            r#"{"env":{"KEEP_ME":"yes"}}"#,
+            &DesiredSettings {
+                sonnet: Some("upstream-sonnet".into()),
+                opus: Some("upstream-opus".into()),
+                haiku: Some("upstream-haiku".into()),
+                fable: Some("upstream-fable".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let patched: Value = serde_json::from_str(&patched).unwrap();
+        let env = patched["env"].as_object().unwrap();
+
+        for (role, model) in [
+            ("SONNET", "upstream-sonnet"),
+            ("OPUS", "upstream-opus"),
+            ("HAIKU", "upstream-haiku"),
+            ("FABLE", "upstream-fable"),
+        ] {
+            assert_eq!(env[&format!("ANTHROPIC_DEFAULT_{role}_MODEL")], model);
+            assert_eq!(env[&format!("ANTHROPIC_DEFAULT_{role}_MODEL_NAME")], model);
+        }
+        assert_eq!(env["KEEP_ME"], "yes");
     }
 
     #[test]
@@ -2569,6 +2705,10 @@ mod tests {
             "1"
         );
         assert!(spec.env_remove.contains(&"ANTHROPIC_API_KEY".into()));
+        assert!(
+            spec.env_remove
+                .contains(&"ANTHROPIC_DEFAULT_HAIKU_MODEL_NAME".into())
+        );
         assert!(
             spec.env_remove
                 .contains(&"CLAUDE_SECURESTORAGE_CONFIG_DIR".into())

@@ -6555,7 +6555,7 @@ dependencies = [
 
 [[package]]
 name = "yaat"
-version = "0.2.2"
+version = "0.2.3"
 dependencies = [
  "aes",
  "aes-gcm",
@@ -6601,7 +6601,7 @@ dependencies = [
 
 [[package]]
 name = "yaat-contracts"
-version = "0.2.2"
+version = "0.2.3"
 dependencies = [
  "serde",
 ]
