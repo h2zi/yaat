@@ -7,15 +7,19 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use yaat_contracts::{HeaderEntry, Platform, ProviderKind, ProviderPlatformConfig, SecretKind};
+use yaat_contracts::{
+    HeaderEntry, Platform, ProviderImportCredentialState, ProviderKind, ProviderPlatformConfig,
+    SecretKind,
+};
+use zeroize::Zeroizing;
 
 use crate::activation::{
     ConfigFormat, OwnedPath, PatchEngine, PatchOperation, remove_atomically, replace_atomically,
 };
 
 use super::{
-    AdapterContext, CommandSpec, CredentialSnapshot, CredentialState, GlobalConfigPlan,
-    PlatformAdapter, ProfileRuntime, claude_desktop_credentials,
+    AdapterContext, CommandSpec, CredentialSnapshot, CredentialState, DiscoveredProvider,
+    GlobalConfigPlan, PlatformAdapter, ProfileRuntime, claude_desktop_credentials,
 };
 
 const USER_DATA_ENV: &str = "CLAUDE_USER_DATA_DIR";
@@ -360,6 +364,29 @@ impl PlatformAdapter for ClaudeDesktopAdapter {
             .map(CredentialState::Present)
     }
 
+    fn discover_import_provider(
+        &self,
+        _context: &AdapterContext,
+        config_root: &Path,
+    ) -> Result<Option<DiscoveredProvider>, String> {
+        discover_current_provider(config_root)
+    }
+
+    fn capture_import_official_credentials(
+        &self,
+        _context: &AdapterContext,
+        config_root: &Path,
+    ) -> Result<CredentialState, String> {
+        let account_config = read_json_object(&config_root.join("config.json"))?;
+        if !claude_desktop_credentials::has_account(&account_config) {
+            return Ok(CredentialState::Absent);
+        }
+        let (data, warning) = claude_desktop_credentials::capture(config_root, &account_config)?;
+        let label = data.label();
+        encode_credential(DesktopCredential::Account { data }, Some(label), warning)
+            .map(CredentialState::Present)
+    }
+
     fn restore_credentials(
         &self,
         _context: &AdapterContext,
@@ -578,8 +605,177 @@ fn global_gateway_root(config_root: &Path) -> Result<PathBuf, String> {
     Ok(config_root.with_file_name(format!("{name}-3p")))
 }
 
+fn discover_current_provider(config_root: &Path) -> Result<Option<DiscoveredProvider>, String> {
+    let desktop_config = read_json_object(&config_root.join(CONFIG_FILE))?;
+    if desktop_config.get("deploymentMode").and_then(Value::as_str) != Some("3p") {
+        return Ok(None);
+    }
+    let gateway_root = global_gateway_root(config_root)?;
+    let library = gateway_root.join(CONFIG_LIBRARY_DIR);
+    let meta = read_json_object(&library.join("_meta.json"))?;
+    let applied_id = meta
+        .get("appliedId")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| "Claude Desktop is in 3P mode but no provider is applied".to_string())?;
+    crate::paths::validate_identifier(applied_id).map_err(|error| error.to_string())?;
+    let entry = read_json_object(&library.join(format!("{applied_id}.json")))?;
+    let base_url = entry
+        .get("inferenceGatewayBaseUrl")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned);
+    let mut credential = entry
+        .get("inferenceGatewayApiKey")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned);
+    let mut secret_kind = match entry
+        .get("inferenceGatewayAuthScheme")
+        .and_then(Value::as_str)
+        .map(|value| value.to_ascii_lowercase())
+        .as_deref()
+    {
+        Some("bearer") => SecretKind::BearerToken,
+        Some("x-api-key") | None => SecretKind::ApiKey,
+        Some(value) => {
+            return Err(format!(
+                "Claude Desktop provider uses unsupported auth scheme `{value}`"
+            ));
+        }
+    };
+    let models = match entry.get("inferenceModels") {
+        Some(Value::Array(values)) => values
+            .iter()
+            .filter_map(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_owned)
+            .collect::<Vec<_>>(),
+        Some(_) => return Err("Claude Desktop inferenceModels must be an array".into()),
+        None => Vec::new(),
+    };
+    let mut custom_headers = Vec::new();
+    let mut user_agent = None;
+    let mut warnings = Vec::new();
+    match entry.get("inferenceCustomHeaders") {
+        Some(Value::Object(headers)) => {
+            for (name, value) in headers {
+                let Some(value) = value.as_str() else {
+                    warnings.push(format!(
+                        "Claude Desktop header `{name}` is not a string and was not imported"
+                    ));
+                    continue;
+                };
+                match name.to_ascii_lowercase().as_str() {
+                    "user-agent" => user_agent = Some(value.to_owned()),
+                    "authorization" => {
+                        if credential.is_none()
+                            && let Some(value) = value.trim().strip_prefix("Bearer ")
+                        {
+                            secret_kind = SecretKind::BearerToken;
+                            credential = Some(value.to_owned());
+                        } else {
+                            warnings.push(
+                                "A custom Authorization header was omitted from the preview; review the direct credential"
+                                    .into(),
+                            );
+                        }
+                    }
+                    "x-api-key" => {
+                        if credential.is_none() {
+                            secret_kind = SecretKind::ApiKey;
+                            credential = Some(value.to_owned());
+                        } else {
+                            warnings.push(
+                                "A duplicate x-api-key header was omitted from the preview".into(),
+                            );
+                        }
+                    }
+                    "proxy-authorization" => warnings
+                        .push("A Proxy-Authorization header was omitted from the preview".into()),
+                    _ => custom_headers.push(HeaderEntry {
+                        name: name.clone(),
+                        value: value.to_owned(),
+                    }),
+                }
+            }
+        }
+        Some(_) => return Err("Claude Desktop inferenceCustomHeaders must be an object".into()),
+        None => {}
+    }
+    if base_url.is_none() {
+        warnings.push("The applied Claude Desktop provider has no Base URL".into());
+    }
+    if models.is_empty() {
+        warnings.push("The applied Claude Desktop provider has no model routes".into());
+    }
+    for model in &models {
+        if !is_safe_direct_model(model) {
+            warnings.push(format!(
+                "Model `{model}` requires the future routing feature and cannot be imported as a direct route"
+            ));
+        }
+    }
+    let official_endpoint = base_url.as_deref().is_some_and(|value| {
+        value.trim_end_matches('/') == OFFICIAL_API_BASE_URL.trim_end_matches('/')
+    });
+    let kind = if official_endpoint {
+        ProviderKind::OfficialApi
+    } else {
+        ProviderKind::ThirdParty
+    };
+    let name = meta
+        .get("entries")
+        .and_then(Value::as_array)
+        .and_then(|entries| {
+            entries
+                .iter()
+                .find(|entry| entry.get("id").and_then(Value::as_str) == Some(applied_id))
+        })
+        .and_then(|entry| entry.get("name"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
+        .or_else(|| {
+            base_url
+                .as_deref()
+                .and_then(|value| url::Url::parse(value).ok())
+                .and_then(|value| value.host_str().map(str::to_owned))
+        })
+        .unwrap_or_else(|| "Claude Desktop Provider".into());
+    let model = models.first().cloned();
+    let credential_state = if credential.is_some() {
+        ProviderImportCredentialState::Ready
+    } else {
+        ProviderImportCredentialState::NeedsInput
+    };
+
+    Ok(Some(DiscoveredProvider {
+        candidate_id: "active_config".into(),
+        kind,
+        name,
+        account_label: Some(applied_id.to_owned()),
+        base_url: (kind == ProviderKind::ThirdParty)
+            .then_some(base_url)
+            .flatten(),
+        model,
+        custom_headers,
+        user_agent,
+        platform_config: ProviderPlatformConfig::ClaudeDesktop { models },
+        secret_kind,
+        secret: credential.map(Zeroizing::new),
+        credential_state,
+        warnings,
+    }))
+}
+
 fn read_optional_file(path: &Path, maximum: u64) -> Result<Option<Vec<u8>>, String> {
-    match fs::metadata(path) {
+    match fs::symlink_metadata(path) {
         Ok(metadata) => {
             if !metadata.file_type().is_file() {
                 return Err(format!("refusing non-regular file {}", path.display()));
@@ -646,7 +842,7 @@ pub(crate) fn validate_direct_model(model: Option<&str>, required: bool) -> Resu
     Ok(())
 }
 
-fn validate_direct_models(models: &[String], required: bool) -> Result<(), String> {
+pub(crate) fn validate_direct_models(models: &[String], required: bool) -> Result<(), String> {
     if required && models.is_empty() {
         return Err("a direct Claude Desktop provider requires at least one model".into());
     }
@@ -718,7 +914,7 @@ fn write_json_atomic(path: &Path, value: &Value) -> Result<(), String> {
 }
 
 fn read_json_object(path: &Path) -> Result<Value, String> {
-    match fs::metadata(path) {
+    match fs::symlink_metadata(path) {
         Ok(metadata) => {
             if !metadata.file_type().is_file() {
                 return Err(format!(
@@ -782,6 +978,41 @@ fn default_executable() -> Result<PathBuf, String> {
 mod tests {
     use super::*;
     use yaat_contracts::{ProfileStatus, ProviderProfile};
+
+    #[test]
+    fn import_follows_the_current_applied_gateway_id() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let root = temp.path().join("Claude");
+        let gateway = temp.path().join("Claude-3p").join(CONFIG_LIBRARY_DIR);
+        fs::create_dir_all(&root).unwrap();
+        fs::create_dir_all(&gateway).unwrap();
+        fs::write(root.join(CONFIG_FILE), r#"{"deploymentMode":"3p"}"#).unwrap();
+        fs::write(
+            gateway.join("_meta.json"),
+            r#"{"appliedId":"manual-provider","entries":[{"id":"manual-provider","name":"Manual Gateway"}]}"#,
+        )
+        .unwrap();
+        fs::write(
+            gateway.join("manual-provider.json"),
+            r#"{
+              "inferenceGatewayBaseUrl":"https://gateway.example.com",
+              "inferenceGatewayApiKey":"private-key",
+              "inferenceGatewayAuthScheme":"x-api-key",
+              "inferenceModels":["claude-sonnet-5","claude-fable-5"],
+              "inferenceCustomHeaders":{"X-Team":"platform","User-Agent":"Custom Agent"}
+            }"#,
+        )
+        .unwrap();
+
+        let provider = discover_current_provider(&root).unwrap().unwrap();
+        assert_eq!(provider.name, "Manual Gateway");
+        assert_eq!(provider.secret_kind, SecretKind::ApiKey);
+        assert_eq!(provider.user_agent.as_deref(), Some("Custom Agent"));
+        let ProviderPlatformConfig::ClaudeDesktop { models } = provider.platform_config else {
+            panic!("wrong platform config");
+        };
+        assert_eq!(models, ["claude-sonnet-5", "claude-fable-5"]);
+    }
 
     fn profile(kind: ProviderKind, model: Option<&str>) -> ProviderProfile {
         ProviderProfile {

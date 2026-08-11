@@ -33,6 +33,19 @@ pub struct Repository {
     connection: Mutex<Connection>,
 }
 
+pub(crate) struct ProviderBatchInsert {
+    pub id: String,
+    pub request: CreateProviderRequest,
+    pub status: ProfileStatus,
+    pub sensitive_records: Vec<ProviderBatchSensitiveRecord>,
+}
+
+pub(crate) struct ProviderBatchSensitiveRecord {
+    pub record_id: String,
+    pub kind: String,
+    pub value: Vec<u8>,
+}
+
 #[derive(Clone, Copy)]
 enum BindingColumn {
     Global,
@@ -203,6 +216,94 @@ impl Repository {
             entity: "provider",
             id,
         })
+    }
+
+    pub(crate) fn import_providers(
+        &self,
+        inputs: Vec<ProviderBatchInsert>,
+    ) -> Result<Vec<ProviderProfile>, DbError> {
+        if inputs.is_empty() {
+            return Err(DbError::InvalidInput(
+                "provider import must contain at least one account",
+            ));
+        }
+        let mut prepared = Vec::with_capacity(inputs.len());
+        for input in inputs {
+            validate_provider_name(&input.request.name)?;
+            validate_secret_input(input.request.secret_kind, input.request.secret.as_deref())?;
+            let credential = match input.request.secret.as_deref() {
+                Some(secret) => Some(self.prepare_text_data(
+                    &input.id,
+                    &credential_record_id(&input.id),
+                    credential_kind(input.request.secret_kind)?,
+                    Some(&input.id),
+                    secret,
+                )?),
+                None => None,
+            };
+            let sensitive_records = input
+                .sensitive_records
+                .iter()
+                .map(|record| {
+                    self.prepare_account_data(
+                        &input.id,
+                        &record.record_id,
+                        &record.kind,
+                        Some(&input.id),
+                        &record.value,
+                    )
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            prepared.push((input, credential, sensitive_records));
+        }
+
+        let now = now_millis();
+        let ids = prepared
+            .iter()
+            .map(|(input, _, _)| input.id.clone())
+            .collect::<Vec<_>>();
+        let mut connection = self.lock()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        for (input, credential, sensitive_records) in &prepared {
+            transaction.execute(
+                "INSERT INTO providers( \
+                    id, platform, kind, name, account_label, base_url, model, custom_headers, \
+                    user_agent, platform_config, secret_kind, status, created_at, updated_at \
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?13)",
+                params![
+                    input.id,
+                    input.request.platform.as_str(),
+                    provider_kind_to_db(input.request.kind),
+                    input.request.name.trim(),
+                    input.request.account_label,
+                    input.request.base_url,
+                    input.request.model,
+                    encode_json(&input.request.custom_headers)?,
+                    input.request.user_agent,
+                    encode_json(&input.request.platform_config)?,
+                    secret_kind_to_db(input.request.secret_kind),
+                    profile_status_to_db(input.status),
+                    now,
+                ],
+            )?;
+            if let Some(record) = credential {
+                upsert_account_data(&transaction, record, now)?;
+            }
+            for record in sensitive_records {
+                upsert_account_data(&transaction, record, now)?;
+            }
+        }
+        transaction.commit()?;
+        drop(connection);
+
+        ids.into_iter()
+            .map(|id| {
+                self.get_provider(&id)?.ok_or_else(|| DbError::NotFound {
+                    entity: "provider",
+                    id,
+                })
+            })
+            .collect()
     }
 
     pub fn update_provider(
@@ -1713,6 +1814,99 @@ mod tests {
                 official_credential: None,
             })
             .unwrap()
+    }
+
+    fn batch_provider(id: &str, name: &str) -> ProviderBatchInsert {
+        ProviderBatchInsert {
+            id: id.into(),
+            request: CreateProviderRequest {
+                platform: Platform::Codex,
+                kind: ProviderKind::ThirdParty,
+                name: name.into(),
+                account_label: None,
+                base_url: Some("https://gateway.example.com/v1".into()),
+                model: Some("gpt-test".into()),
+                custom_headers: Vec::new(),
+                user_agent: None,
+                platform_config: yaat_contracts::ProviderPlatformConfig::Codex {
+                    default_model: Some("gpt-test".into()),
+                    catalog: Vec::new(),
+                },
+                secret_kind: SecretKind::BearerToken,
+                secret: Some("private-token".into()),
+                official_credential: None,
+            },
+            status: ProfileStatus::Ready,
+            sensitive_records: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn provider_batch_import_rolls_back_all_candidates_on_failure() {
+        let repository = repository();
+        let result = repository.import_providers(vec![
+            batch_provider("same-id", "First"),
+            batch_provider("same-id", "Second"),
+        ]);
+
+        assert!(result.is_err());
+        assert!(repository.list_providers(None).unwrap().is_empty());
+    }
+
+    #[test]
+    fn provider_batch_import_saves_direct_and_official_accounts_without_profile_homes() {
+        let repository = repository();
+        let official_id = "official-id";
+        let official_record_id = format!("provider/{official_id}/auth_snapshot");
+        let official = ProviderBatchInsert {
+            id: official_id.into(),
+            request: CreateProviderRequest {
+                platform: Platform::Codex,
+                kind: ProviderKind::OfficialSubscription,
+                name: "OpenAI".into(),
+                account_label: Some("person@example.com".into()),
+                base_url: None,
+                model: None,
+                custom_headers: Vec::new(),
+                user_agent: None,
+                platform_config: yaat_contracts::ProviderPlatformConfig::empty_for(Platform::Codex),
+                secret_kind: SecretKind::None,
+                secret: None,
+                official_credential: None,
+            },
+            status: ProfileStatus::Ready,
+            sensitive_records: vec![ProviderBatchSensitiveRecord {
+                record_id: official_record_id.clone(),
+                kind: "provider.auth_snapshot.v1".into(),
+                value: b"official-snapshot".to_vec(),
+            }],
+        };
+
+        let profiles = repository
+            .import_providers(vec![batch_provider("direct-id", "Gateway"), official])
+            .unwrap();
+
+        assert_eq!(profiles.len(), 2);
+        assert!(
+            profiles
+                .iter()
+                .all(|profile| profile.profile_home.is_none())
+        );
+        assert!(
+            profiles
+                .iter()
+                .all(|profile| profile.status == ProfileStatus::Ready)
+        );
+        let stored = repository
+            .load_sensitive_record(SensitiveRecordKey {
+                profile_id: official_id,
+                record_id: &official_record_id,
+                kind: "provider.auth_snapshot.v1",
+                provider_id: Some(official_id),
+            })
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.expose(), b"official-snapshot");
     }
 
     #[test]

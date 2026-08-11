@@ -39,7 +39,6 @@ import type {
   CodexCatalogModel,
   FetchedModel,
   HeaderEntry,
-  ImportCurrentRequest,
   Platform,
   ProviderKind,
   ProviderProfile,
@@ -50,7 +49,7 @@ import type {
 } from "@/types";
 import { emptyPlatformConfig } from "@/types";
 
-export type ProviderDialogMode = "create" | "edit" | "import";
+export type ProviderDialogMode = "create" | "edit";
 
 interface ProviderDialogProps {
   open: boolean;
@@ -60,10 +59,13 @@ interface ProviderDialogProps {
   profile?: ProviderProfile | null;
   language: Language;
   busy: boolean;
+  credentialAvailable?: boolean;
+  lockKind?: boolean;
+  titleOverride?: string;
+  submitLabel?: string;
   onLoadCredential: (profileId: string) => Promise<string | null>;
   onCreate: (request: CreateProviderRequest) => Promise<void>;
   onUpdate: (request: UpdateProviderRequest) => Promise<void>;
-  onImport: (request: ImportCurrentRequest) => Promise<void>;
 }
 
 export function ProviderDialog({
@@ -74,10 +76,13 @@ export function ProviderDialog({
   profile,
   language,
   busy,
+  credentialAvailable = false,
+  lockKind = false,
+  titleOverride,
+  submitLabel,
   onLoadCredential,
   onCreate,
   onUpdate,
-  onImport,
 }: ProviderDialogProps) {
   const t = (key: TranslationKey) => translate(language, key);
   const [kind, setKind] = useState<ProviderKind>("official_subscription");
@@ -182,18 +187,10 @@ export function ProviderDialog({
     if (
       mode === "create" &&
       kind !== "official_subscription" &&
-      !secret.trim()
+      !secret.trim() &&
+      !credentialAvailable
     ) {
       setValidation(t("required"));
-      return;
-    }
-
-    if (mode === "import") {
-      await onImport({
-        platform,
-        name: name.trim(),
-        accountLabel: optional(accountLabel),
-      });
       return;
     }
     if (mode === "edit" && profile) {
@@ -202,7 +199,8 @@ export function ProviderDialog({
         name: name.trim(),
         accountLabel: optional(accountLabel),
         baseUrl: kind === "third_party" ? optional(baseUrl) : profile.baseUrl,
-        model: kind === "third_party" ? optional(model) : profile.model,
+        model:
+          kind === "official_subscription" ? profile.model : optional(model),
         customHeaders,
         userAgent: optional(userAgent),
         platformConfig: withDefaultModel(platformConfig, optional(model)),
@@ -224,7 +222,7 @@ export function ProviderDialog({
       name: name.trim(),
       accountLabel: optional(accountLabel),
       baseUrl: kind === "third_party" ? optional(baseUrl) : null,
-      model: kind === "third_party" ? optional(model) : null,
+      model: kind === "official_subscription" ? null : optional(model),
       customHeaders,
       userAgent: optional(userAgent),
       platformConfig: withDefaultModel(platformConfig, optional(model)),
@@ -295,11 +293,8 @@ export function ProviderDialog({
   };
 
   const title =
-    mode === "create"
-      ? t("dialogCreateTitle")
-      : mode === "edit"
-        ? t("dialogEditTitle")
-        : t("dialogImportTitle");
+    titleOverride ??
+    (mode === "create" ? t("dialogCreateTitle") : t("dialogEditTitle"));
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
@@ -322,45 +317,42 @@ export function ProviderDialog({
               }
             />
           </div>
-          {mode !== "import" ? (
-            <div className="grid gap-2">
-              <Label htmlFor="provider-kind">{t("providerType")}</Label>
-              <Select
-                value={kind}
-                disabled={mode === "edit"}
-                onValueChange={(value) => {
-                  const next = value as ProviderKind;
-                  setKind(next);
-                  if (next === "official_subscription")
-                    setSecretKind("api_key");
-                }}
-              >
-                <SelectTrigger id="provider-kind" className="w-full">
-                  <SelectValue />
-                </SelectTrigger>
-                <SelectContent>
-                  <SelectItem value="official_subscription">
-                    <span className="flex items-center gap-2">
-                      <ShieldCheck className="size-4 text-primary" />
-                      {t("officialSubscription")}
-                    </span>
-                  </SelectItem>
-                  <SelectItem value="official_api">
-                    <span className="flex items-center gap-2">
-                      <KeyRound className="size-4 text-amber-600" />
-                      {t("officialApi")}
-                    </span>
-                  </SelectItem>
-                  <SelectItem value="third_party">
-                    <span className="flex items-center gap-2">
-                      <Server className="size-4 text-sky-600" />
-                      {t("thirdParty")}
-                    </span>
-                  </SelectItem>
-                </SelectContent>
-              </Select>
-            </div>
-          ) : null}
+          <div className="grid gap-2">
+            <Label htmlFor="provider-kind">{t("providerType")}</Label>
+            <Select
+              value={kind}
+              disabled={mode === "edit" || lockKind}
+              onValueChange={(value) => {
+                const next = value as ProviderKind;
+                setKind(next);
+                if (next === "official_subscription") setSecretKind("api_key");
+              }}
+            >
+              <SelectTrigger id="provider-kind" className="w-full">
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem value="official_subscription">
+                  <span className="flex items-center gap-2">
+                    <ShieldCheck className="size-4 text-primary" />
+                    {t("officialSubscription")}
+                  </span>
+                </SelectItem>
+                <SelectItem value="official_api">
+                  <span className="flex items-center gap-2">
+                    <KeyRound className="size-4 text-amber-600" />
+                    {t("officialApi")}
+                  </span>
+                </SelectItem>
+                <SelectItem value="third_party">
+                  <span className="flex items-center gap-2">
+                    <Server className="size-4 text-sky-600" />
+                    {t("thirdParty")}
+                  </span>
+                </SelectItem>
+              </SelectContent>
+            </Select>
+          </div>
 
           <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
             <div className="grid gap-2">
@@ -386,7 +378,7 @@ export function ProviderDialog({
             </div>
           </div>
 
-          {kind === "third_party" && mode !== "import" ? (
+          {kind === "third_party" ? (
             <div className="grid gap-4 rounded-xl border border-border bg-muted/35 p-4">
               <div className="flex items-center gap-2 text-sm font-medium">
                 <Server className="size-4 text-primary" />
@@ -410,54 +402,68 @@ export function ProviderDialog({
             </div>
           ) : null}
 
-          {kind === "official_subscription" && mode !== "import" ? (
+          {kind === "official_subscription" ? (
             <div className="grid gap-2 rounded-xl border border-border bg-muted/35 p-4">
-              <div className="flex items-center justify-between gap-3">
-                <Label htmlFor="official-credential">
-                  {t("officialCredential")}
-                </Label>
-                <Button
-                  type="button"
-                  variant="ghost"
-                  size="icon-sm"
-                  disabled={credentialLoading || !secret}
-                  aria-label={t(
-                    credentialCopied ? "credentialCopied" : "copyCredential",
-                  )}
-                  title={t(
-                    credentialCopied ? "credentialCopied" : "copyCredential",
-                  )}
-                  onClick={() => void copyCredential()}
-                >
-                  {credentialLoading ? (
-                    <LoaderCircle className="animate-spin" />
-                  ) : credentialCopied ? (
-                    <Check />
-                  ) : (
-                    <Copy />
-                  )}
-                </Button>
-              </div>
-              <Textarea
-                id="official-credential"
-                className="min-h-40 font-mono text-xs leading-relaxed"
-                disabled={credentialLoading}
-                spellCheck={false}
-                value={secret}
-                onChange={(event) => {
-                  setSecret(event.target.value);
-                  setCredentialCopied(false);
-                }}
-                placeholder={t(
-                  credentialLoading
-                    ? "credentialLoading"
-                    : "officialCredentialPlaceholder",
-                )}
-              />
+              {credentialAvailable && mode === "create" ? (
+                <p className="text-sm text-muted-foreground">
+                  {language === "zh"
+                    ? "已安全检测到官方登录凭据，导入时不会把凭据发送到界面。"
+                    : "The official sign-in credential was detected securely and is not sent to the UI."}
+                </p>
+              ) : (
+                <>
+                  <div className="flex items-center justify-between gap-3">
+                    <Label htmlFor="official-credential">
+                      {t("officialCredential")}
+                    </Label>
+                    <Button
+                      type="button"
+                      variant="ghost"
+                      size="icon-sm"
+                      disabled={credentialLoading || !secret}
+                      aria-label={t(
+                        credentialCopied
+                          ? "credentialCopied"
+                          : "copyCredential",
+                      )}
+                      title={t(
+                        credentialCopied
+                          ? "credentialCopied"
+                          : "copyCredential",
+                      )}
+                      onClick={() => void copyCredential()}
+                    >
+                      {credentialLoading ? (
+                        <LoaderCircle className="animate-spin" />
+                      ) : credentialCopied ? (
+                        <Check />
+                      ) : (
+                        <Copy />
+                      )}
+                    </Button>
+                  </div>
+                  <Textarea
+                    id="official-credential"
+                    className="min-h-40 font-mono text-xs leading-relaxed"
+                    disabled={credentialLoading}
+                    spellCheck={false}
+                    value={secret}
+                    onChange={(event) => {
+                      setSecret(event.target.value);
+                      setCredentialCopied(false);
+                    }}
+                    placeholder={t(
+                      credentialLoading
+                        ? "credentialLoading"
+                        : "officialCredentialPlaceholder",
+                    )}
+                  />
+                </>
+              )}
             </div>
           ) : null}
 
-          {kind !== "official_subscription" && mode !== "import" ? (
+          {kind !== "official_subscription" ? (
             <div className="grid gap-4 rounded-xl border border-border bg-muted/35 p-4">
               <div className="grid gap-2 sm:grid-cols-[10rem_1fr] sm:items-end">
                 <div className="grid gap-2">
@@ -493,11 +499,17 @@ export function ProviderDialog({
                         setSecret(event.target.value);
                         setCredentialCopied(false);
                       }}
-                      placeholder={t(
-                        credentialLoading
-                          ? "credentialLoading"
-                          : "credentialPlaceholder",
-                      )}
+                      placeholder={
+                        credentialAvailable && mode === "create"
+                          ? language === "zh"
+                            ? "已检测到凭据；留空即可使用"
+                            : "Credential detected; leave blank to use it"
+                          : t(
+                              credentialLoading
+                                ? "credentialLoading"
+                                : "credentialPlaceholder",
+                            )
+                      }
                     />
                     <Button
                       type="button"
@@ -547,7 +559,7 @@ export function ProviderDialog({
             </div>
           ) : null}
 
-          {kind === "third_party" && mode !== "import" ? (
+          {kind !== "official_subscription" ? (
             <div className="grid gap-4 rounded-xl border border-border bg-muted/35 p-4">
               <div className="grid gap-2">
                 <Label htmlFor="model">{t("model")}</Label>
@@ -854,7 +866,7 @@ export function ProviderDialog({
             </div>
           ) : null}
 
-          {kind === "third_party" && mode !== "import" ? (
+          {kind !== "official_subscription" ? (
             <div className="grid gap-4 rounded-xl border border-border bg-muted/35 p-4">
               <div className="flex items-center justify-between gap-3">
                 <p className="text-sm font-medium">{t("customHeaders")}</p>
@@ -912,7 +924,6 @@ export function ProviderDialog({
                   id="user-agent"
                   value={userAgent}
                   onChange={(event) => setUserAgent(event.target.value)}
-                  placeholder="YAAT/0.1"
                 />
               </div>
             </div>
@@ -942,11 +953,7 @@ export function ProviderDialog({
               ) : (
                 <ShieldCheck />
               )}
-              {mode === "create"
-                ? t("create")
-                : mode === "import"
-                  ? t("import")
-                  : t("save")}
+              {submitLabel ?? (mode === "create" ? t("create") : t("save"))}
             </Button>
           </DialogFooter>
         </form>

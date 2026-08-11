@@ -125,7 +125,7 @@ export function AccountCard({
                 ? "CX"
                 : profile.platform === "claude_desktop"
                   ? "CD"
-                  : "CL"}
+                  : "CC"}
             </span>
           </div>
           <div className="min-w-0 flex-1">

@@ -360,7 +360,7 @@ export function UsageDashboard({
                 runQuery("range", startDate, endDate, false, next);
               }}
             >
-              <SelectTrigger className="h-8 w-48">
+              <SelectTrigger size="sm" className="w-48">
                 <SelectValue />
               </SelectTrigger>
               <SelectContent>
@@ -380,7 +380,7 @@ export function UsageDashboard({
                 )
               }
             >
-              <SelectTrigger className="ml-auto h-8 w-40">
+              <SelectTrigger size="sm" className="ml-auto w-40">
                 <SelectValue />
               </SelectTrigger>
               <SelectContent>

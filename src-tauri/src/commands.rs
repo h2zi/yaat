@@ -14,16 +14,20 @@ use std::time::{Duration, Instant};
 use chrono_tz::Tz;
 use secrecy::ExposeSecret;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use tauri::{AppHandle, State, ipc::Channel};
+use uuid::Uuid;
 use yaat_contracts::{
     ActivateProviderRequest, ActivationMode, ApiError, AppSettings, BootstrapResponse,
     CaptureCredentialsRequest, CreateProviderRequest, DeactivateGlobalRequest,
     DeleteProviderRequest, HistoryApplyRequest, HistoryApplyResult, HistoryPreview,
-    HistoryPreviewRequest, HistoryScope, HistorySyncState, HistorySyncStatus, ImportCurrentRequest,
-    LaunchRequest, LoginRequest, ModelFetchRequest, ModelFetchResponse, OperationProgress,
-    OperationResult, Platform, PlatformState, ProfileStatus, ProviderCredentialRequest,
-    ProviderCredentialResponse, ProviderKind, ProviderProfile, ReleaseUpdate, SecretKind,
-    UpdateProgress, UpdateProviderRequest, UsageQueryRequest, UsageReport, UsageRescanRequest,
+    HistoryPreviewRequest, HistoryScope, HistorySyncState, HistorySyncStatus, LaunchRequest,
+    LoginRequest, ModelFetchRequest, ModelFetchResponse, OperationProgress, OperationResult,
+    Platform, PlatformState, ProfileStatus, ProviderCredentialRequest, ProviderCredentialResponse,
+    ProviderImportCandidate, ProviderImportCommitRequest, ProviderImportCredentialState,
+    ProviderImportPreview, ProviderImportPreviewRequest, ProviderImportResult,
+    ProviderImportSource, ProviderKind, ProviderProfile, ReleaseUpdate, SecretKind, UpdateProgress,
+    UpdateProviderRequest, UsageQueryRequest, UsageReport, UsageRescanRequest,
 };
 use zeroize::{Zeroize, Zeroizing};
 
@@ -32,9 +36,11 @@ use crate::activation::{
     RollbackOutcome, remove_atomically, replace_atomically,
 };
 use crate::app_state::AppState;
-use crate::db::SensitiveRecordKey;
+use crate::db::{ProviderBatchInsert, ProviderBatchSensitiveRecord, SensitiveRecordKey};
 use crate::error::{AppError, AppResult};
-use crate::platform::{CredentialSnapshot, CredentialState, ProfileRuntime, SidecarPlan};
+use crate::platform::{
+    CredentialSnapshot, CredentialState, DiscoveredProvider, ProfileRuntime, SidecarPlan,
+};
 use crate::usage::service;
 use crate::{history, launcher, paths, process, updates, validation};
 
@@ -257,17 +263,57 @@ pub fn provider_update(
             request.model.as_deref(),
             request.secret_kind,
         )?;
-        if provider_execution_changed(&current, &request) {
-            reject_globally_active_profile_mutation(&state, &current)?;
+        let execution_changed = provider_execution_changed(&current, &request);
+        let globally_active = execution_changed && is_globally_active_profile(&state, &current)?;
+        if globally_active {
+            ensure_platform_stopped(current.platform)?;
         }
+        let previous_secret =
+            if globally_active && current.kind != ProviderKind::OfficialSubscription {
+                state
+                    .repository
+                    .load_provider_secret(&current.id)
+                    .map_err(AppError::from)?
+            } else {
+                None
+            };
+        let previous_official_credential =
+            if globally_active && replacement_official_credential.is_some() {
+                load_snapshot_optional(&state, &current.id)?
+            } else {
+                None
+            };
         let updated = state
             .repository
             .update_provider(&request)
             .map_err(AppError::from)?;
-        match replacement_official_credential {
+        let updated = match replacement_official_credential {
             Some(snapshot) => install_official_credential(&state, &updated, &snapshot),
             None => Ok(updated),
+        };
+        let updated = match updated {
+            Ok(updated) => updated,
+            Err(error) if globally_active => {
+                let rollback = rollback_active_provider_update(
+                    &state,
+                    &current,
+                    previous_secret.as_ref(),
+                    previous_official_credential.as_ref(),
+                );
+                return Err(with_provider_update_rollback(error, &rollback));
+            }
+            Err(error) => return Err(error),
+        };
+        if globally_active && let Err(error) = activate_global(&state, &updated) {
+            let rollback = rollback_active_provider_update(
+                &state,
+                &current,
+                previous_secret.as_ref(),
+                previous_official_credential.as_ref(),
+            );
+            return Err(with_provider_update_rollback(error, &rollback));
         }
+        Ok(updated)
     })())
 }
 
@@ -353,7 +399,6 @@ pub fn provider_login(
 ) -> Result<OperationResult, ApiError> {
     api((|| {
         let profile = require_profile(&state, &request.profile_id)?;
-        reject_globally_active_profile_mutation(&state, &profile)?;
         state.validate_profile_for_platform(&profile)?;
         let settings = state.repository.load_settings().map_err(AppError::from)?;
         let context = state.context(profile.platform, &settings);
@@ -403,11 +448,19 @@ pub fn provider_capture(
 }
 
 #[tauri::command]
-pub fn provider_import_current(
+pub fn provider_import_preview(
     state: State<'_, AppState>,
-    request: ImportCurrentRequest,
-) -> Result<OperationResult, ApiError> {
-    api(import_current_inner(&state, &request))
+    request: ProviderImportPreviewRequest,
+) -> Result<ProviderImportPreview, ApiError> {
+    api(discover_provider_import(&state, request.platform).map(|discovery| discovery.preview))
+}
+
+#[tauri::command]
+pub fn provider_import_commit(
+    state: State<'_, AppState>,
+    request: ProviderImportCommitRequest,
+) -> Result<ProviderImportResult, ApiError> {
+    api(commit_provider_import(&state, request))
 }
 
 #[tauri::command]
@@ -1505,12 +1558,17 @@ fn validate_platform_profile_shape(
 
 fn provider_capture_inner(state: &AppState, profile_id: &str) -> AppResult<OperationResult> {
     let profile = require_profile(state, profile_id)?;
-    reject_globally_active_profile_mutation(state, &profile)?;
     if profile.kind != ProviderKind::OfficialSubscription {
         return Err(AppError::Validation(
             "only official subscription profiles capture private CLI credentials".into(),
         ));
     }
+    let globally_active = is_globally_active_profile(state, &profile)?;
+    let previous_snapshot = if globally_active {
+        load_snapshot_optional(state, &profile.id)?
+    } else {
+        None
+    };
     let settings = state.repository.load_settings().map_err(AppError::from)?;
     let context = state.context(profile.platform, &settings);
     let home = paths::managed_profile_home(profile.platform, &profile.id)?;
@@ -1523,89 +1581,442 @@ fn provider_capture_inner(state: &AppState, profile_id: &str) -> AppResult<Opera
         .map_err(AppError::Credential)?;
     let warning = snapshot.warning.clone();
     store_snapshot(state, &profile.id, &snapshot)?;
-    state
+    let updated = state
         .repository
         .update_provider_runtime_state(&profile.id, ProfileStatus::Ready, Some(path_text(&home)?))
         .map_err(AppError::from)?;
+    if globally_active && let Err(error) = activate_global(state, &updated) {
+        let rollback = match previous_snapshot.as_ref() {
+            Some(previous) => match install_official_credential(state, &profile, previous) {
+                Ok(_) => "previous credential restored".into(),
+                Err(rollback_error) => {
+                    format!("failed to restore previous credential: {rollback_error}")
+                }
+            },
+            None => "no previous credential snapshot was available".into(),
+        };
+        return Err(with_provider_update_rollback(error, &rollback));
+    }
     Ok(operation("credentials captured", warning))
 }
 
-fn import_current_inner(
+enum ImportCredential {
+    Direct(Option<Zeroizing<String>>),
+    Official(CredentialSnapshot),
+}
+
+struct InternalImportCandidate {
+    public: ProviderImportCandidate,
+    credential: ImportCredential,
+}
+
+struct InternalImportDiscovery {
+    preview: ProviderImportPreview,
+    candidates: Vec<InternalImportCandidate>,
+}
+
+fn discover_provider_import(
     state: &AppState,
-    request: &ImportCurrentRequest,
-) -> AppResult<OperationResult> {
-    validation::validate_name(&request.name)?;
-    validation::validate_account_label(request.account_label.as_deref())?;
-    if request.platform == Platform::ClaudeDesktop {
+    platform: Platform,
+) -> AppResult<InternalImportDiscovery> {
+    if platform == Platform::ClaudeDesktop {
         process::ensure_claude_desktop_is_stopped()?;
     }
     let settings = state.repository.load_settings().map_err(AppError::from)?;
-    let context = state.context(request.platform, &settings);
-    let source_root = state.config_root(request.platform, &settings)?;
-    let snapshot = state
-        .adapter(request.platform)
-        .capture_credentials(&context, &source_root)
-        .map_err(AppError::Credential)?;
-    let warning = snapshot.warning.clone();
-    let create = CreateProviderRequest {
-        platform: request.platform,
-        kind: ProviderKind::OfficialSubscription,
-        name: request.name.clone(),
-        account_label: request
-            .account_label
-            .clone()
-            .or_else(|| snapshot.account_label.clone()),
-        base_url: None,
-        model: None,
-        custom_headers: Vec::new(),
-        user_agent: None,
-        platform_config: yaat_contracts::ProviderPlatformConfig::empty_for(request.platform),
-        secret_kind: SecretKind::None,
-        secret: None,
-        official_credential: None,
+    let context = state.context(platform, &settings);
+    let source_root = state.config_root(platform, &settings)?;
+    let adapter = state.adapter(platform);
+    let mut warnings = Vec::new();
+    let mut direct = match adapter.discover_import_provider(&context, &source_root) {
+        Ok(value) => value,
+        Err(error) => {
+            warnings.push(format!(
+                "Unable to inspect the active provider configuration: {error}"
+            ));
+            None
+        }
     };
-    let profile = state
-        .repository
-        .create_provider(&create)
-        .map_err(AppError::from)?;
-    let imported = (|| {
-        let home = state
-            .adapter(request.platform)
-            .prepare_profile(
-                &context,
-                ProfileRuntime {
-                    profile: &profile,
-                    secret: None,
-                },
-            )
-            .map_err(AppError::ConfigMalformed)?;
-        state
-            .adapter(request.platform)
-            .restore_credentials(&context, &home, &snapshot)
-            .map_err(AppError::Credential)?;
-        store_snapshot(state, &profile.id, &snapshot)?;
-        state
-            .repository
-            .update_provider_runtime_state(
-                &profile.id,
-                ProfileStatus::Ready,
-                Some(path_text(&home)?),
-            )
-            .map_err(AppError::from)
-    })();
+    let official = match adapter.capture_import_official_credentials(&context, &source_root) {
+        Ok(value) => Some(value),
+        Err(error) => {
+            warnings.push(format!(
+                "Unable to inspect the official credential slot: {error}"
+            ));
+            None
+        }
+    };
 
-    match imported {
-        Ok(_) => Ok(operation("current account imported", warning)),
-        Err(error) => match state
-            .repository
-            .delete_provider(&DeleteProviderRequest { id: profile.id })
+    let mut candidates = Vec::new();
+    if let Some(provider) = direct.as_mut() {
+        if let Some(CredentialState::Present(snapshot)) = official.as_ref()
+            && platform == Platform::Codex
+            && provider.kind == ProviderKind::OfficialApi
+            && provider.secret.is_none()
+            && let Some(api_key) =
+                crate::platform::codex::CodexAdapter::extract_api_key(&snapshot.opaque_payload)
+                    .map_err(AppError::Credential)?
         {
-            Ok(()) => Err(error),
-            Err(cleanup_error) => Err(AppError::Internal(format!(
-                "{error}; failed to remove the incomplete imported account: {cleanup_error}"
-            ))),
-        },
+            provider.secret_kind = SecretKind::ApiKey;
+            provider.secret = Some(api_key);
+            provider.credential_state = ProviderImportCredentialState::Ready;
+        }
+        candidates.push(direct_candidate(provider));
     }
+
+    if let Some(CredentialState::Present(snapshot)) = official {
+        let native_api_key = if platform == Platform::Codex {
+            crate::platform::codex::CodexAdapter::extract_api_key(&snapshot.opaque_payload)
+                .map_err(AppError::Credential)?
+        } else {
+            None
+        };
+        let merge_with_active_codex_api = native_api_key.as_ref().is_some_and(|native| {
+            direct.as_ref().is_some_and(|provider| {
+                provider.kind == ProviderKind::OfficialApi
+                    && provider.secret.as_ref().is_some_and(|active| {
+                        constant_time_equal(active.as_bytes(), native.as_bytes())
+                    })
+            })
+        });
+        if !merge_with_active_codex_api {
+            candidates.push(official_candidate(platform, snapshot, direct.is_none())?);
+        }
+    }
+
+    let source_revision = import_source_revision(platform, &candidates, &warnings)?;
+    for candidate in &mut candidates {
+        candidate.public.already_imported_provider_id =
+            find_existing_import(state, platform, candidate)?;
+    }
+    let public = candidates
+        .iter()
+        .map(|candidate| candidate.public.clone())
+        .collect();
+    Ok(InternalImportDiscovery {
+        preview: ProviderImportPreview {
+            platform,
+            source_revision,
+            candidates: public,
+            warnings,
+        },
+        candidates,
+    })
+}
+
+fn direct_candidate(provider: &DiscoveredProvider) -> InternalImportCandidate {
+    InternalImportCandidate {
+        public: ProviderImportCandidate {
+            candidate_id: provider.candidate_id.clone(),
+            source: ProviderImportSource::ActiveConfig,
+            active: true,
+            kind: provider.kind,
+            name: provider.name.clone(),
+            account_label: provider.account_label.clone(),
+            base_url: provider.base_url.clone(),
+            model: provider.model.clone(),
+            custom_headers: provider.custom_headers.clone(),
+            user_agent: provider.user_agent.clone(),
+            platform_config: provider.platform_config.clone(),
+            secret_kind: provider.secret_kind,
+            credential_state: provider.credential_state,
+            already_imported_provider_id: None,
+            warnings: provider.warnings.clone(),
+        },
+        credential: ImportCredential::Direct(provider.secret.clone()),
+    }
+}
+
+fn official_candidate(
+    platform: Platform,
+    snapshot: CredentialSnapshot,
+    active: bool,
+) -> AppResult<InternalImportCandidate> {
+    if platform == Platform::Codex
+        && let Some(secret) =
+            crate::platform::codex::CodexAdapter::extract_api_key(&snapshot.opaque_payload)
+                .map_err(AppError::Credential)?
+    {
+        return Ok(InternalImportCandidate {
+            public: ProviderImportCandidate {
+                candidate_id: "official_credential".into(),
+                source: ProviderImportSource::OfficialCredential,
+                active,
+                kind: ProviderKind::OfficialApi,
+                name: "OpenAI API".into(),
+                account_label: snapshot.account_label.clone(),
+                base_url: None,
+                model: None,
+                custom_headers: Vec::new(),
+                user_agent: None,
+                platform_config: yaat_contracts::ProviderPlatformConfig::empty_for(platform),
+                secret_kind: SecretKind::ApiKey,
+                credential_state: ProviderImportCredentialState::Ready,
+                already_imported_provider_id: None,
+                warnings: snapshot.warning.clone().into_iter().collect(),
+            },
+            credential: ImportCredential::Direct(Some(secret)),
+        });
+    }
+    let name = match platform {
+        Platform::Codex => "OpenAI",
+        Platform::ClaudeCode => "Claude",
+        Platform::ClaudeDesktop => "Claude Desktop",
+    };
+    let warning = snapshot.warning.clone().into_iter().collect();
+    Ok(InternalImportCandidate {
+        public: ProviderImportCandidate {
+            candidate_id: "official_credential".into(),
+            source: ProviderImportSource::OfficialCredential,
+            active,
+            kind: ProviderKind::OfficialSubscription,
+            name: name.into(),
+            account_label: snapshot.account_label.clone(),
+            base_url: None,
+            model: None,
+            custom_headers: Vec::new(),
+            user_agent: None,
+            platform_config: yaat_contracts::ProviderPlatformConfig::empty_for(platform),
+            secret_kind: SecretKind::None,
+            credential_state: ProviderImportCredentialState::Ready,
+            already_imported_provider_id: None,
+            warnings: warning,
+        },
+        credential: ImportCredential::Official(snapshot),
+    })
+}
+
+fn import_source_revision(
+    platform: Platform,
+    candidates: &[InternalImportCandidate],
+    warnings: &[String],
+) -> AppResult<String> {
+    let mut digest = Sha256::new();
+    digest.update(platform.as_str().as_bytes());
+    digest.update(
+        serde_json::to_vec(warnings).map_err(|error| AppError::Internal(error.to_string()))?,
+    );
+    for candidate in candidates {
+        let mut public = candidate.public.clone();
+        public.already_imported_provider_id = None;
+        digest.update(
+            serde_json::to_vec(&public).map_err(|error| AppError::Internal(error.to_string()))?,
+        );
+        match &candidate.credential {
+            ImportCredential::Direct(secret) => {
+                digest.update(b"direct");
+                if let Some(secret) = secret {
+                    digest.update(secret.as_bytes());
+                }
+            }
+            ImportCredential::Official(snapshot) => {
+                digest.update(b"official");
+                digest.update(snapshot.storage_kind.as_bytes());
+                digest.update(&snapshot.opaque_payload);
+            }
+        }
+    }
+    Ok(hex::encode(digest.finalize()))
+}
+
+fn find_existing_import(
+    state: &AppState,
+    platform: Platform,
+    candidate: &InternalImportCandidate,
+) -> AppResult<Option<String>> {
+    let profiles = state
+        .repository
+        .list_providers(Some(platform))
+        .map_err(AppError::from)?;
+    for profile in profiles {
+        if profile.kind != candidate.public.kind
+            || normalized_url(profile.base_url.as_deref())
+                != normalized_url(candidate.public.base_url.as_deref())
+            || profile.model != candidate.public.model
+            || !headers_equal(&profile.custom_headers, &candidate.public.custom_headers)
+            || profile.user_agent != candidate.public.user_agent
+            || profile.platform_config != candidate.public.platform_config
+        {
+            continue;
+        }
+        let credentials_match = match &candidate.credential {
+            ImportCredential::Direct(Some(candidate_secret)) => state
+                .repository
+                .load_provider_secret(&profile.id)
+                .map_err(AppError::from)?
+                .is_some_and(|saved| {
+                    constant_time_equal(
+                        saved.expose_secret().as_bytes(),
+                        candidate_secret.as_bytes(),
+                    )
+                }),
+            ImportCredential::Direct(None) => false,
+            ImportCredential::Official(candidate_snapshot) => {
+                load_snapshot_optional(state, &profile.id)?.is_some_and(|saved| {
+                    saved.storage_kind == candidate_snapshot.storage_kind
+                        && ((candidate_snapshot.account_label.is_some()
+                            && saved.account_label == candidate_snapshot.account_label)
+                            || constant_time_equal(
+                                &saved.opaque_payload,
+                                &candidate_snapshot.opaque_payload,
+                            ))
+                })
+            }
+        };
+        if credentials_match {
+            return Ok(Some(profile.id));
+        }
+    }
+    Ok(None)
+}
+
+fn normalized_url(value: Option<&str>) -> Option<String> {
+    value.map(|value| value.trim().trim_end_matches('/').to_ascii_lowercase())
+}
+
+fn headers_equal(
+    left: &[yaat_contracts::HeaderEntry],
+    right: &[yaat_contracts::HeaderEntry],
+) -> bool {
+    let normalize = |headers: &[yaat_contracts::HeaderEntry]| {
+        let mut headers = headers
+            .iter()
+            .map(|header| {
+                (
+                    header.name.trim().to_ascii_lowercase(),
+                    header.value.clone(),
+                )
+            })
+            .collect::<Vec<_>>();
+        headers.sort();
+        headers
+    };
+    normalize(left) == normalize(right)
+}
+
+fn constant_time_equal(left: &[u8], right: &[u8]) -> bool {
+    let mut difference = left.len() ^ right.len();
+    let maximum = left.len().max(right.len());
+    for index in 0..maximum {
+        let left = left.get(index).copied().unwrap_or_default();
+        let right = right.get(index).copied().unwrap_or_default();
+        difference |= usize::from(left ^ right);
+    }
+    difference == 0
+}
+
+fn commit_provider_import(
+    state: &AppState,
+    request: ProviderImportCommitRequest,
+) -> AppResult<ProviderImportResult> {
+    if request.selections.is_empty() || request.selections.len() > 8 {
+        return Err(AppError::Validation(
+            "select between one and eight discovered accounts".into(),
+        ));
+    }
+    let discovery = discover_provider_import(state, request.platform)?;
+    if !constant_time_equal(
+        discovery.preview.source_revision.as_bytes(),
+        request.source_revision.as_bytes(),
+    ) {
+        return Err(AppError::ConfigConflict(
+            "the client configuration changed after the import preview; scan it again".into(),
+        ));
+    }
+    let mut seen = std::collections::HashSet::new();
+    let mut inserts = Vec::with_capacity(request.selections.len());
+    for selection in request.selections {
+        if !seen.insert(selection.candidate_id.clone()) {
+            return Err(AppError::Validation(
+                "an import candidate was selected more than once".into(),
+            ));
+        }
+        let candidate = discovery
+            .candidates
+            .iter()
+            .find(|candidate| candidate.public.candidate_id == selection.candidate_id)
+            .ok_or_else(|| {
+                AppError::Validation("an import candidate is no longer available".into())
+            })?;
+        if candidate.public.already_imported_provider_id.is_some() {
+            return Err(AppError::Validation(format!(
+                "{} is already imported",
+                candidate.public.name
+            )));
+        }
+        let mut provider = selection.provider;
+        if provider.platform != request.platform || provider.kind != candidate.public.kind {
+            return Err(AppError::Validation(
+                "an imported account cannot change platform or provider type".into(),
+            ));
+        }
+        if provider.official_credential.is_some() {
+            return Err(AppError::Validation(
+                "imported credentials must come from the scanned source".into(),
+            ));
+        }
+        let id = Uuid::new_v4().to_string();
+        let mut sensitive_records = Vec::new();
+        match &candidate.credential {
+            ImportCredential::Direct(discovered_secret) => {
+                if provider.secret.is_none() {
+                    provider.secret = discovered_secret
+                        .as_ref()
+                        .map(|secret| secret.as_str().to_owned());
+                }
+                if provider.secret.is_none() {
+                    return Err(AppError::Validation(format!(
+                        "{} requires a direct credential",
+                        candidate.public.name
+                    )));
+                }
+            }
+            ImportCredential::Official(snapshot) => {
+                if provider.kind != ProviderKind::OfficialSubscription
+                    || provider.secret_kind != SecretKind::None
+                    || provider.secret.is_some()
+                {
+                    return Err(AppError::Validation(
+                        "an official subscription import cannot contain an API credential".into(),
+                    ));
+                }
+                if provider.account_label.is_none() {
+                    provider.account_label = snapshot.account_label.clone();
+                }
+                let stored = StoredCredentialSnapshot::from(snapshot);
+                let encoded = serde_json::to_vec(&stored)
+                    .map_err(|error| AppError::Internal(error.to_string()))?;
+                sensitive_records.push(ProviderBatchSensitiveRecord {
+                    record_id: auth_snapshot_record_id(&id),
+                    kind: AUTH_SNAPSHOT_KIND.into(),
+                    value: encoded,
+                });
+            }
+        }
+        validation::validate_create(&provider)?;
+        validate_platform_profile_shape(
+            provider.platform,
+            provider.kind,
+            provider.model.as_deref(),
+            provider.secret_kind,
+        )?;
+        if let yaat_contracts::ProviderPlatformConfig::ClaudeDesktop { models } =
+            &provider.platform_config
+        {
+            crate::platform::claude_desktop::validate_direct_models(models, false)
+                .map_err(AppError::Validation)?;
+        }
+        inserts.push(ProviderBatchInsert {
+            id,
+            request: provider,
+            status: ProfileStatus::Ready,
+            sensitive_records,
+        });
+    }
+    let profiles = state
+        .repository
+        .import_providers(inserts)
+        .map_err(AppError::from)?;
+    Ok(ProviderImportResult { profiles })
 }
 
 fn store_snapshot(
@@ -2076,7 +2487,10 @@ fn require_ready_profile(state: &AppState, id: &str) -> AppResult<ProviderProfil
 }
 
 fn provider_execution_changed(current: &ProviderProfile, request: &UpdateProviderRequest) -> bool {
-    current.base_url != request.base_url
+    (current.platform == Platform::Codex
+        && current.kind == ProviderKind::ThirdParty
+        && current.name.trim() != request.name.trim())
+        || current.base_url != request.base_url
         || current.model != request.model
         || current.custom_headers != request.custom_headers
         || current.user_agent != request.user_agent
@@ -2086,20 +2500,65 @@ fn provider_execution_changed(current: &ProviderProfile, request: &UpdateProvide
         || request.replacement_official_credential.is_some()
 }
 
-fn reject_globally_active_profile_mutation(
-    state: &AppState,
-    profile: &ProviderProfile,
-) -> AppResult<()> {
+fn is_globally_active_profile(state: &AppState, profile: &ProviderProfile) -> AppResult<bool> {
     let binding = state
         .repository
         .get_platform_binding(profile.platform)
         .map_err(AppError::from)?;
-    if binding.global_profile_id.as_deref() == Some(profile.id.as_str()) {
-        return Err(AppError::ConfigConflict(
-            "stop global management before changing or reauthenticating the active provider".into(),
-        ));
+    Ok(binding.global_profile_id.as_deref() == Some(profile.id.as_str()))
+}
+
+fn rollback_active_provider_update(
+    state: &AppState,
+    previous: &ProviderProfile,
+    previous_secret: Option<&secrecy::SecretString>,
+    previous_official_credential: Option<&CredentialSnapshot>,
+) -> String {
+    let mut rollback_request = UpdateProviderRequest {
+        id: previous.id.clone(),
+        name: previous.name.clone(),
+        account_label: previous.account_label.clone(),
+        base_url: previous.base_url.clone(),
+        model: previous.model.clone(),
+        custom_headers: previous.custom_headers.clone(),
+        user_agent: previous.user_agent.clone(),
+        platform_config: previous.platform_config.clone(),
+        secret_kind: previous.secret_kind,
+        replacement_secret: previous_secret.map(|secret| secret.expose_secret().to_owned()),
+        replacement_official_credential: None,
+    };
+    let provider_rollback = state.repository.update_provider(&rollback_request);
+    if let Some(secret) = rollback_request.replacement_secret.as_mut() {
+        secret.zeroize();
     }
-    Ok(())
+    if let Err(error) = provider_rollback {
+        return format!("failed to restore saved provider: {error}");
+    }
+
+    if let Some(snapshot) = previous_official_credential
+        && let Err(error) = install_official_credential(state, previous, snapshot)
+    {
+        return format!("saved provider restored, but credential rollback failed: {error}");
+    }
+    "saved provider and credential restored".into()
+}
+
+fn with_provider_update_rollback(error: AppError, rollback: &str) -> AppError {
+    match error {
+        AppError::ConfigConflict(message) => {
+            AppError::ConfigConflict(format!("{message}; provider rollback: {rollback}"))
+        }
+        AppError::ConfigMalformed(message) => {
+            AppError::ConfigMalformed(format!("{message}; provider rollback: {rollback}"))
+        }
+        AppError::Credential(message) => {
+            AppError::Credential(format!("{message}; provider rollback: {rollback}"))
+        }
+        AppError::Database(message) => {
+            AppError::Database(format!("{message}; provider rollback: {rollback}"))
+        }
+        other => AppError::Internal(format!("{other}; provider rollback: {rollback}")),
+    }
 }
 
 fn path_text(path: &Path) -> AppResult<&str> {
@@ -2170,6 +2629,37 @@ mod tests {
 
     use super::*;
 
+    #[test]
+    fn import_preview_redacts_discovered_credentials_but_revision_tracks_them() {
+        let discovered = |secret: &str| DiscoveredProvider {
+            candidate_id: "active_config".into(),
+            kind: ProviderKind::ThirdParty,
+            name: "Gateway".into(),
+            account_label: None,
+            base_url: Some("https://gateway.example.com/v1".into()),
+            model: Some("gpt-test".into()),
+            custom_headers: Vec::new(),
+            user_agent: None,
+            platform_config: yaat_contracts::ProviderPlatformConfig::Codex {
+                default_model: Some("gpt-test".into()),
+                catalog: Vec::new(),
+            },
+            secret_kind: SecretKind::BearerToken,
+            secret: Some(Zeroizing::new(secret.into())),
+            credential_state: ProviderImportCredentialState::Ready,
+            warnings: Vec::new(),
+        };
+        let first = vec![direct_candidate(&discovered("private-one"))];
+        let second = vec![direct_candidate(&discovered("private-two"))];
+
+        let serialized = serde_json::to_string(&first[0].public).unwrap();
+        assert!(!serialized.contains("private-one"));
+        assert_ne!(
+            import_source_revision(Platform::Codex, &first, &[]).unwrap(),
+            import_source_revision(Platform::Codex, &second, &[]).unwrap()
+        );
+    }
+
     fn change(path: &str, before: serde_json::Value, after: serde_json::Value) -> PathChange {
         PathChange {
             path: OwnedPath::from_json_pointer(path).unwrap(),
@@ -2198,6 +2688,8 @@ mod tests {
     #[test]
     fn provider_display_edits_do_not_count_as_execution_changes() {
         let current = ProviderProfile {
+            platform: Platform::ClaudeCode,
+            kind: ProviderKind::ThirdParty,
             base_url: Some("https://api.example.com".into()),
             model: Some("model-a".into()),
             secret_kind: SecretKind::ApiKey,
@@ -2221,6 +2713,34 @@ mod tests {
         let mut credential_change = display_only;
         credential_change.replacement_secret = Some("new-secret".into());
         assert!(provider_execution_changed(&current, &credential_change));
+    }
+
+    #[test]
+    fn active_codex_third_party_name_change_regenerates_provider_config() {
+        let current = ProviderProfile {
+            platform: Platform::Codex,
+            kind: ProviderKind::ThirdParty,
+            name: "Old gateway".into(),
+            base_url: Some("https://api.example.com".into()),
+            model: Some("model-a".into()),
+            secret_kind: SecretKind::ApiKey,
+            ..ProviderProfile::default()
+        };
+        let request = UpdateProviderRequest {
+            id: "profile-a".into(),
+            name: "New gateway".into(),
+            account_label: current.account_label.clone(),
+            base_url: current.base_url.clone(),
+            model: current.model.clone(),
+            custom_headers: current.custom_headers.clone(),
+            user_agent: current.user_agent.clone(),
+            platform_config: current.platform_config.clone(),
+            secret_kind: current.secret_kind,
+            replacement_secret: None,
+            replacement_official_credential: None,
+        };
+
+        assert!(provider_execution_changed(&current, &request));
     }
 
     #[test]

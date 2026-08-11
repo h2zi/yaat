@@ -29,6 +29,7 @@ import {
   ProviderDialog,
   type ProviderDialogMode,
 } from "@/components/provider-dialog";
+import { ProviderImportDialog } from "@/components/provider-import-dialog";
 import { SettingsDialog } from "@/components/settings-dialog";
 import {
   AlertDialog,
@@ -75,10 +76,10 @@ import type {
   AppSettings,
   BootstrapResponse,
   CreateProviderRequest,
-  ImportCurrentRequest,
   OperationResult,
   OperationProgress,
   Platform,
+  ProviderImportCommitRequest,
   ProviderProfile,
   ReleaseUpdate,
   UpdateProgress,
@@ -87,10 +88,13 @@ import type {
 } from "@/types";
 
 type MainTab = "accounts" | "usage";
-type DialogState = {
-  mode: ProviderDialogMode;
-  profile?: ProviderProfile | null;
-} | null;
+type DialogState =
+  | {
+      mode: ProviderDialogMode;
+      profile?: ProviderProfile | null;
+    }
+  | { mode: "import" }
+  | null;
 
 const UsageDashboard = lazy(() =>
   import("@/components/usage-dashboard").then((module) => ({
@@ -272,10 +276,10 @@ export default function App() {
       () => setProviderDialog(null),
     );
   };
-  const importCurrent = async (request: ImportCurrentRequest) => {
+  const commitProviderImport = async (request: ProviderImportCommitRequest) => {
     await perform(
       "provider_import",
-      () => api.importCurrent(request),
+      () => api.commitProviderImport(request),
       t("imported"),
       () => setProviderDialog(null),
     );
@@ -854,13 +858,17 @@ export default function App() {
       </AlertDialog>
 
       <ProviderDialog
-        open={providerDialog !== null}
+        open={providerDialog !== null && providerDialog.mode !== "import"}
         onOpenChange={(open) => {
           if (!open) setProviderDialog(null);
         }}
-        mode={providerDialog?.mode ?? "create"}
+        mode={providerDialog?.mode === "edit" ? "edit" : "create"}
         platform={platform}
-        profile={providerDialog?.profile}
+        profile={
+          providerDialog && providerDialog.mode !== "import"
+            ? providerDialog.profile
+            : null
+        }
         language={language}
         busy={
           busyAction === "provider_save" || busyAction === "provider_import"
@@ -868,7 +876,18 @@ export default function App() {
         onLoadCredential={loadProviderCredential}
         onCreate={createProvider}
         onUpdate={updateProvider}
-        onImport={importCurrent}
+      />
+
+      <ProviderImportDialog
+        open={providerDialog?.mode === "import"}
+        onOpenChange={(open) => {
+          if (!open) setProviderDialog(null);
+        }}
+        platform={platform}
+        language={language}
+        busy={busyAction === "provider_import"}
+        onPreview={api.previewProviderImport}
+        onCommit={commitProviderImport}
       />
 
       <AlertDialog

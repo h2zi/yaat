@@ -12,14 +12,17 @@ use std::time::Duration;
 
 use base64::Engine as _;
 use directories::BaseDirs;
-use jsonc_parser::ParseOptions;
 use jsonc_parser::cst::{CstInputValue, CstObject, CstRootNode};
+use jsonc_parser::{ParseOptions, parse_to_serde_value};
 use serde_json::{Map, Value};
 #[cfg(any(target_os = "macos", windows, test))]
 use sha2::{Digest, Sha256};
 #[cfg(any(target_os = "macos", windows, test))]
 use unicode_normalization::UnicodeNormalization;
-use yaat_contracts::{Platform, ProviderKind, ProviderPlatformConfig, SecretKind};
+use yaat_contracts::{
+    HeaderEntry, Platform, ProviderImportCredentialState, ProviderKind, ProviderPlatformConfig,
+    SecretKind,
+};
 use zeroize::{Zeroize, Zeroizing};
 
 use crate::activation::{
@@ -27,8 +30,8 @@ use crate::activation::{
 };
 
 use super::{
-    AdapterContext, CommandSpec, CredentialSnapshot, CredentialState, GlobalConfigPlan,
-    PlatformAdapter, ProfileRuntime,
+    AdapterContext, CommandSpec, CredentialSnapshot, CredentialState, DiscoveredProvider,
+    GlobalConfigPlan, PlatformAdapter, ProfileRuntime,
 };
 
 const SETTINGS_FILE_NAME: &str = "settings.json";
@@ -457,6 +460,14 @@ impl PlatformAdapter for ClaudeAdapter {
         }))
     }
 
+    fn discover_import_provider(
+        &self,
+        _context: &AdapterContext,
+        config_root: &Path,
+    ) -> Result<Option<DiscoveredProvider>, String> {
+        discover_current_provider(config_root)
+    }
+
     fn restore_credentials(
         &self,
         context: &AdapterContext,
@@ -682,7 +693,7 @@ fn default_claude_config_root() -> Result<PathBuf, String> {
 
 fn read_bounded_text(path: &Path, limit: u64) -> Result<String, String> {
     let metadata =
-        fs::metadata(path).map_err(|_| format!("unable to inspect {}", path.display()))?;
+        fs::symlink_metadata(path).map_err(|_| format!("unable to inspect {}", path.display()))?;
     if !metadata.is_file() || metadata.len() > limit {
         return Err(format!(
             "{} has an unsupported size or type",
@@ -691,6 +702,185 @@ fn read_bounded_text(path: &Path, limit: u64) -> Result<String, String> {
     }
     let bytes = fs::read(path).map_err(|_| format!("unable to read {}", path.display()))?;
     String::from_utf8(bytes).map_err(|_| format!("{} is not UTF-8", path.display()))
+}
+
+fn discover_current_provider(config_root: &Path) -> Result<Option<DiscoveredProvider>, String> {
+    let path = config_root.join(SETTINGS_FILE_NAME);
+    match fs::metadata(&path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(format!(
+                "unable to inspect Claude Code settings {}: {error}",
+                path.display()
+            ));
+        }
+        Ok(_) => {}
+    }
+    let raw = read_bounded_text(&path, MAX_SETTINGS_BYTES)?;
+    let value: Value = parse_to_serde_value(&raw, &ParseOptions::default())
+        .map_err(|error| format!("Claude Code settings are malformed: {error}"))?;
+    let object = value
+        .as_object()
+        .ok_or_else(|| "Claude Code settings root must be an object".to_string())?;
+    let env = match object.get("env") {
+        Some(Value::Object(env)) => env,
+        Some(_) => return Err("Claude Code settings `env` must be an object".into()),
+        None => {
+            static EMPTY: std::sync::LazyLock<Map<String, Value>> =
+                std::sync::LazyLock::new(Map::new);
+            &EMPTY
+        }
+    };
+    let env_string = |name: &str| {
+        env.get(name)
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_owned)
+    };
+    let base_url = env_string("ANTHROPIC_BASE_URL");
+    let api_key = env_string("ANTHROPIC_API_KEY");
+    let auth_token = env_string("ANTHROPIC_AUTH_TOKEN");
+    let helper = object
+        .get("apiKeyHelper")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let custom_header_text = env_string("ANTHROPIC_CUSTOM_HEADERS");
+    let model = env_string("ANTHROPIC_MODEL").or_else(|| {
+        object
+            .get("model")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_owned)
+    });
+    let has_direct_configuration =
+        base_url.is_some() || api_key.is_some() || auth_token.is_some() || helper.is_some();
+    if !has_direct_configuration {
+        return Ok(None);
+    }
+
+    let official_endpoint = base_url
+        .as_deref()
+        .is_none_or(|value| value.trim_end_matches('/') == "https://api.anthropic.com");
+    let kind = if official_endpoint {
+        ProviderKind::OfficialApi
+    } else {
+        ProviderKind::ThirdParty
+    };
+    let mut warnings = Vec::new();
+    if api_key.is_some() && auth_token.is_some() {
+        warnings.push(
+            "Both ANTHROPIC_API_KEY and ANTHROPIC_AUTH_TOKEN are set; the bearer token is the active imported credential"
+                .into(),
+        );
+    }
+    let (mut secret_kind, mut secret) = if let Some(value) = auth_token {
+        (SecretKind::BearerToken, Some(value))
+    } else if let Some(value) = api_key {
+        (SecretKind::ApiKey, Some(value))
+    } else {
+        (SecretKind::ApiKey, None)
+    };
+
+    let mut custom_headers = Vec::new();
+    let mut user_agent = None;
+    if let Some(value) = custom_header_text.as_deref() {
+        for (index, line) in value.lines().enumerate() {
+            let line = line.trim();
+            if line.is_empty() {
+                continue;
+            }
+            let Some((name, value)) = line.split_once(':') else {
+                warnings.push(format!(
+                    "Claude custom header line {} is malformed and was not imported",
+                    index + 1
+                ));
+                continue;
+            };
+            let name = name.trim();
+            let value = value.trim();
+            match name.to_ascii_lowercase().as_str() {
+                "user-agent" => user_agent = Some(value.to_owned()),
+                "authorization" => {
+                    if secret.is_none()
+                        && let Some(value) = value.strip_prefix("Bearer ")
+                    {
+                        secret_kind = SecretKind::BearerToken;
+                        secret = Some(value.to_owned());
+                    } else {
+                        warnings.push(
+                            "A custom Authorization header was omitted from the preview; review the direct credential"
+                                .into(),
+                        );
+                    }
+                }
+                "x-api-key" => {
+                    if secret.is_none() {
+                        secret_kind = SecretKind::ApiKey;
+                        secret = Some(value.to_owned());
+                    } else {
+                        warnings.push(
+                            "A duplicate x-api-key header was omitted from the preview".into(),
+                        );
+                    }
+                }
+                "proxy-authorization" => warnings
+                    .push("A Proxy-Authorization header was omitted from the preview".into()),
+                _ => custom_headers.push(HeaderEntry {
+                    name: name.to_owned(),
+                    value: value.to_owned(),
+                }),
+            }
+        }
+    }
+    if kind == ProviderKind::ThirdParty && model.is_none() {
+        warnings.push(
+            "The current Claude provider has no default model; enter one before importing".into(),
+        );
+    }
+    let credential_state = if secret.is_some() {
+        ProviderImportCredentialState::Ready
+    } else if helper.is_some() {
+        warnings.push(
+            "apiKeyHelper is not executed during import; enter a direct credential before importing"
+                .into(),
+        );
+        ProviderImportCredentialState::UnsupportedHelper
+    } else {
+        ProviderImportCredentialState::NeedsInput
+    };
+    let name = base_url
+        .as_deref()
+        .and_then(|value| url::Url::parse(value).ok())
+        .and_then(|value| value.host_str().map(str::to_owned))
+        .unwrap_or_else(|| "Anthropic API".into());
+
+    Ok(Some(DiscoveredProvider {
+        candidate_id: "active_config".into(),
+        kind,
+        name,
+        account_label: None,
+        base_url: (kind == ProviderKind::ThirdParty)
+            .then_some(base_url)
+            .flatten(),
+        model: model.clone(),
+        custom_headers,
+        user_agent,
+        platform_config: ProviderPlatformConfig::ClaudeCode {
+            default_model: model,
+            sonnet: env_string("ANTHROPIC_DEFAULT_SONNET_MODEL"),
+            opus: env_string("ANTHROPIC_DEFAULT_OPUS_MODEL"),
+            haiku: env_string("ANTHROPIC_DEFAULT_HAIKU_MODEL"),
+            fable: env_string("ANTHROPIC_DEFAULT_FABLE_MODEL"),
+            subagent: env_string("CLAUDE_CODE_SUBAGENT_MODEL"),
+        },
+        secret_kind,
+        secret: secret.map(Zeroizing::new),
+        credential_state,
+        warnings,
+    }))
 }
 
 fn write_private_atomic(path: &Path, bytes: &[u8]) -> Result<(), String> {
@@ -2006,6 +2196,63 @@ mod tests {
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use yaat_contracts::{ProfileStatus, ProviderProfile};
+
+    #[test]
+    fn import_discovers_direct_provider_and_all_model_mappings() {
+        let root = tempfile::TempDir::new().unwrap();
+        fs::write(
+            root.path().join(SETTINGS_FILE_NAME),
+            r#"{
+              // imported user settings
+              "env": {
+                "ANTHROPIC_BASE_URL": "https://gateway.example.com",
+                "ANTHROPIC_AUTH_TOKEN": "private-token",
+                "ANTHROPIC_MODEL": "claude-default",
+                "ANTHROPIC_DEFAULT_SONNET_MODEL": "claude-sonnet",
+                "ANTHROPIC_DEFAULT_OPUS_MODEL": "claude-opus",
+                "ANTHROPIC_DEFAULT_HAIKU_MODEL": "claude-haiku",
+                "ANTHROPIC_DEFAULT_FABLE_MODEL": "claude-fable",
+                "CLAUDE_CODE_SUBAGENT_MODEL": "claude-subagent",
+                "ANTHROPIC_CUSTOM_HEADERS": "X-Team: platform\nUser-Agent: Custom Agent"
+              }
+            }"#,
+        )
+        .unwrap();
+
+        let provider = discover_current_provider(root.path()).unwrap().unwrap();
+        assert_eq!(provider.kind, ProviderKind::ThirdParty);
+        assert_eq!(provider.secret_kind, SecretKind::BearerToken);
+        assert_eq!(provider.user_agent.as_deref(), Some("Custom Agent"));
+        let ProviderPlatformConfig::ClaudeCode {
+            default_model,
+            sonnet,
+            opus,
+            haiku,
+            fable,
+            subagent,
+        } = provider.platform_config
+        else {
+            panic!("wrong platform config");
+        };
+        assert_eq!(default_model.as_deref(), Some("claude-default"));
+        assert_eq!(sonnet.as_deref(), Some("claude-sonnet"));
+        assert_eq!(opus.as_deref(), Some("claude-opus"));
+        assert_eq!(haiku.as_deref(), Some("claude-haiku"));
+        assert_eq!(fable.as_deref(), Some("claude-fable"));
+        assert_eq!(subagent.as_deref(), Some("claude-subagent"));
+    }
+
+    #[test]
+    fn import_does_not_treat_an_official_model_preference_as_an_api_account() {
+        let root = tempfile::TempDir::new().unwrap();
+        fs::write(
+            root.path().join(SETTINGS_FILE_NAME),
+            r#"{"model":"sonnet","env":{"ANTHROPIC_DEFAULT_FABLE_MODEL":"claude-fable"}}"#,
+        )
+        .unwrap();
+
+        assert!(discover_current_provider(root.path()).unwrap().is_none());
+    }
 
     #[derive(Default)]
     struct MockCredentialStore {

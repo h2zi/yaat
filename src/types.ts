@@ -225,10 +225,52 @@ export interface ActivateProviderRequest {
   mode: ActivationMode;
 }
 
-export interface ImportCurrentRequest {
+export type ProviderImportSource = "active_config" | "official_credential";
+export type ProviderImportCredentialState =
+  "ready" | "needs_input" | "unsupported_helper";
+
+export interface ProviderImportPreviewRequest {
   platform: Platform;
+}
+
+export interface ProviderImportCandidate {
+  candidateId: string;
+  source: ProviderImportSource;
+  active: boolean;
+  kind: ProviderKind;
   name: string;
   accountLabel: string | null;
+  baseUrl: string | null;
+  model: string | null;
+  customHeaders: HeaderEntry[];
+  userAgent: string | null;
+  platformConfig: ProviderPlatformConfig;
+  secretKind: SecretKind;
+  credentialState: ProviderImportCredentialState;
+  alreadyImportedProviderId: string | null;
+  warnings: string[];
+}
+
+export interface ProviderImportPreview {
+  platform: Platform;
+  sourceRevision: string;
+  candidates: ProviderImportCandidate[];
+  warnings: string[];
+}
+
+export interface ProviderImportSelection {
+  candidateId: string;
+  provider: CreateProviderRequest;
+}
+
+export interface ProviderImportCommitRequest {
+  platform: Platform;
+  sourceRevision: string;
+  selections: ProviderImportSelection[];
+}
+
+export interface ProviderImportResult {
+  profiles: ProviderProfile[];
 }
 
 export interface UsageQueryRequest {

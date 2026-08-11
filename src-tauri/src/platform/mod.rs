@@ -15,7 +15,10 @@ use std::fmt;
 use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
-use yaat_contracts::ProviderProfile;
+use yaat_contracts::{
+    HeaderEntry, ProviderImportCredentialState, ProviderKind, ProviderPlatformConfig,
+    ProviderProfile, SecretKind,
+};
 use zeroize::{Zeroize, ZeroizeOnDrop};
 
 use crate::activation::{ConfigFormat, PatchOperation};
@@ -112,6 +115,25 @@ pub struct SidecarPlan {
     pub contents: Option<Vec<u8>>,
 }
 
+/// Secret-bearing result used only inside the backend while importing the
+/// currently active direct provider. IPC responses are built from a redacted
+/// projection of this value.
+pub struct DiscoveredProvider {
+    pub candidate_id: String,
+    pub kind: ProviderKind,
+    pub name: String,
+    pub account_label: Option<String>,
+    pub base_url: Option<String>,
+    pub model: Option<String>,
+    pub custom_headers: Vec<HeaderEntry>,
+    pub user_agent: Option<String>,
+    pub platform_config: ProviderPlatformConfig,
+    pub secret_kind: SecretKind,
+    pub secret: Option<zeroize::Zeroizing<String>>,
+    pub credential_state: ProviderImportCredentialState,
+    pub warnings: Vec<String>,
+}
+
 pub trait PlatformAdapter: Send + Sync {
     fn discover_cli(&self, context: &AdapterContext) -> Result<(PathBuf, String), String>;
     fn prepare_profile(
@@ -144,6 +166,20 @@ pub trait PlatformAdapter: Send + Sync {
     ) -> Result<CredentialState, String> {
         self.capture_credentials(context, config_root)
             .map(CredentialState::Present)
+    }
+    fn discover_import_provider(
+        &self,
+        _context: &AdapterContext,
+        _config_root: &std::path::Path,
+    ) -> Result<Option<DiscoveredProvider>, String> {
+        Ok(None)
+    }
+    fn capture_import_official_credentials(
+        &self,
+        context: &AdapterContext,
+        config_root: &std::path::Path,
+    ) -> Result<CredentialState, String> {
+        self.capture_credential_state(context, config_root)
     }
     fn restore_credentials(
         &self,

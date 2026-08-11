@@ -9,6 +9,7 @@ import {
 import { Popover as PopoverPrimitive } from "radix-ui";
 
 import { Button } from "@/components/ui/button";
+import { selectTriggerStyles } from "@/components/ui/select";
 import type { Language, Translator } from "@/i18n";
 import { cn, dateDaysAgo } from "@/lib/utils";
 
@@ -183,13 +184,13 @@ export function UsageDateRange({
   return (
     <PopoverPrimitive.Root open={open} onOpenChange={setPopoverOpen}>
       <PopoverPrimitive.Trigger asChild>
-        <Button
+        <button
           type="button"
-          variant="secondary"
-          size="sm"
+          data-size="sm"
           disabled={disabled}
           className={cn(
-            "h-8 gap-2 px-2.5 text-left text-foreground",
+            selectTriggerStyles,
+            "text-left",
             open && "border-ring ring-[3px] ring-ring/20",
           )}
         >
@@ -205,7 +206,7 @@ export function UsageDateRange({
               open && "rotate-180",
             )}
           />
-        </Button>
+        </button>
       </PopoverPrimitive.Trigger>
       <PopoverPrimitive.Portal>
         <PopoverPrimitive.Content

@@ -11,12 +11,14 @@
     "allow-provider-create",
     "allow-provider-update",
     "allow-provider-credential-get",
+    "allow-provider-models-fetch",
     "allow-provider-delete",
     "allow-provider-activate",
     "allow-provider-global-deactivate",
     "allow-provider-login",
     "allow-provider-capture",
-    "allow-provider-import-current",
+    "allow-provider-import-preview",
+    "allow-provider-import-commit",
     "allow-profile-launch",
     "allow-usage-query",
     "allow-usage-rescan",
@@ -24,6 +26,7 @@
     "allow-settings-update",
     "allow-history-preview",
     "allow-history-apply",
-    "allow-history-cancel"
+    "allow-history-cancel",
+    "allow-history-sync-status"
   ]
 }

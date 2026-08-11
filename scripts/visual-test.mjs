@@ -9,9 +9,10 @@ const url = "http://127.0.0.1:4173";
 
 await mkdir(output, { recursive: true });
 
+const viteCli = path.resolve("node_modules/vite/bin/vite.js");
 const server = spawn(
-  "pnpm",
-  ["run", "preview", "--host", "127.0.0.1", "--port", "4173", "--strictPort"],
+  process.execPath,
+  [viteCli, "--host", "127.0.0.1", "--port", "4173", "--strictPort"],
   { stdio: "inherit", env: { ...process.env, VITE_YAAT_PREVIEW: "1" } },
 );
 
@@ -52,6 +53,65 @@ try {
     path: path.join(output, "accounts-light.png"),
     fullPage: true,
   });
+
+  await page.getByRole("button", { name: "导入当前账号" }).click();
+  const importDialog = page
+    .getByRole("dialog")
+    .filter({ hasText: "导入当前账号与配置" });
+  await importDialog.getByText("当前生效").waitFor();
+  await importDialog.getByText("已发现的官方登录").waitFor();
+  await page.screenshot({
+    path: path.join(output, "provider-import-preview.png"),
+    fullPage: true,
+  });
+  await importDialog.getByRole("button", { name: "检查配置" }).first().click();
+  const reviewDialog = page
+    .getByRole("dialog")
+    .filter({ hasText: "检查导入配置" });
+  await reviewDialog
+    .locator('input[value="https://gateway.example.com/v1"]')
+    .waitFor();
+  await reviewDialog.getByText("凭据", { exact: true }).waitFor();
+  await page.screenshot({
+    path: path.join(output, "provider-import-review.png"),
+    fullPage: true,
+  });
+  await page.keyboard.press("Escape");
+  await reviewDialog.waitFor({ state: "hidden" });
+  await page.keyboard.press("Escape");
+  await importDialog.waitFor({ state: "hidden" });
+
+  await page.getByRole("combobox").first().click();
+  await page.getByRole("option", { name: "Claude Code" }).click();
+  await page.getByText("Claude Max").waitFor();
+  await page.getByText("CC", { exact: true }).waitFor();
+  await page.getByRole("button", { name: "导入当前账号" }).click();
+  const claudeImportDialog = page
+    .getByRole("dialog")
+    .filter({ hasText: "导入当前账号与配置" });
+  await claudeImportDialog
+    .getByRole("button", { name: "检查配置" })
+    .first()
+    .click();
+  const claudeReviewDialog = page
+    .getByRole("dialog")
+    .filter({ hasText: "检查导入配置" });
+  const fableMapping = claudeReviewDialog.getByLabel("Fable");
+  await fableMapping.waitFor();
+  if ((await fableMapping.inputValue()) !== "claude-fable-4-5") {
+    throw new Error("Claude Code import must preserve the Fable model mapping");
+  }
+  await page.screenshot({
+    path: path.join(output, "claude-code-provider-import-review.png"),
+    fullPage: true,
+  });
+  await page.keyboard.press("Escape");
+  await claudeReviewDialog.waitFor({ state: "hidden" });
+  await page.keyboard.press("Escape");
+  await claudeImportDialog.waitFor({ state: "hidden" });
+  await page.getByRole("combobox").first().click();
+  await page.getByRole("option", { name: "Codex" }).click();
+  await page.waitForTimeout(250);
 
   await page.getByRole("button", { name: "启动", exact: true }).first().click();
   await page.getByRole("dialog").getByText("启动项目会话").waitFor();
@@ -124,6 +184,38 @@ try {
   const dateRangeButton = page.getByRole("button", {
     name: /2026-07-29 — 2026-08-04/,
   });
+  const modelFilter = page
+    .getByRole("combobox")
+    .filter({ hasText: "全部模型" });
+  const [dateControl, modelControl] = await Promise.all([
+    dateRangeButton.evaluate((element) => {
+      const style = getComputedStyle(element);
+      return {
+        height: element.getBoundingClientRect().height,
+        borderRadius: style.borderRadius,
+        borderWidth: style.borderWidth,
+        borderStyle: style.borderStyle,
+        backgroundColor: style.backgroundColor,
+        boxShadow: style.boxShadow,
+      };
+    }),
+    modelFilter.evaluate((element) => {
+      const style = getComputedStyle(element);
+      return {
+        height: element.getBoundingClientRect().height,
+        borderRadius: style.borderRadius,
+        borderWidth: style.borderWidth,
+        borderStyle: style.borderStyle,
+        backgroundColor: style.backgroundColor,
+        boxShadow: style.boxShadow,
+      };
+    }),
+  ]);
+  if (JSON.stringify(dateControl) !== JSON.stringify(modelControl)) {
+    throw new Error(
+      `Usage date and model controls must share the same frame style: ${JSON.stringify({ dateControl, modelControl })}`,
+    );
+  }
   await dateRangeButton.click();
   await page.waitForTimeout(200);
   if (

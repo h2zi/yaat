@@ -6,7 +6,6 @@ import type {
   AppSettings,
   BootstrapResponse,
   CreateProviderRequest,
-  ImportCurrentRequest,
   ModelFetchRequest,
   ModelFetchResponse,
   HistoryApplyRequest,
@@ -18,6 +17,10 @@ import type {
   OperationResult,
   Platform,
   ProviderCredentialResponse,
+  ProviderImportCommitRequest,
+  ProviderImportPreview,
+  ProviderImportPreviewRequest,
+  ProviderImportResult,
   ProviderProfile,
   ReleaseUpdate,
   UpdateProgress,
@@ -42,7 +45,8 @@ const commands = {
   deactivateGlobal: "provider_global_deactivate",
   login: "provider_login",
   capture: "provider_capture",
-  importCurrent: "provider_import_current",
+  previewProviderImport: "provider_import_preview",
+  commitProviderImport: "provider_import_commit",
   launch: "profile_launch",
   queryUsage: "usage_query",
   rescanUsage: "usage_rescan",
@@ -178,10 +182,19 @@ export const api = {
       ? previewApi.capture(profileId)
       : request(commands.capture, { profileId }),
 
-  importCurrent: (value: ImportCurrentRequest): Promise<OperationResult> =>
+  previewProviderImport: (
+    value: ProviderImportPreviewRequest,
+  ): Promise<ProviderImportPreview> =>
     preview
-      ? previewApi.importCurrent(value)
-      : request(commands.importCurrent, value),
+      ? previewApi.previewProviderImport(value)
+      : request(commands.previewProviderImport, value),
+
+  commitProviderImport: (
+    value: ProviderImportCommitRequest,
+  ): Promise<ProviderImportResult> =>
+    preview
+      ? previewApi.commitProviderImport(value)
+      : request(commands.commitProviderImport, value),
 
   launch: (
     platform: Platform,

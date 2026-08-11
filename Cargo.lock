@@ -2555,6 +2555,9 @@ name = "jsonc-parser"
 version = "0.33.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a0560e3f9a9a03ea6b6e90b41138c5db9e21526c99eb192c1a26c68176593285"
+dependencies = [
+ "serde",
+]
 
 [[package]]
 name = "jsonptr"
@@ -6552,7 +6555,7 @@ dependencies = [
 
 [[package]]
 name = "yaat"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "aes",
  "aes-gcm",
@@ -6598,7 +6601,7 @@ dependencies = [
 
 [[package]]
 name = "yaat-contracts"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "serde",
 ]

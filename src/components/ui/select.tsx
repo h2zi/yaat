@@ -8,6 +8,9 @@ const Select = SelectPrimitive.Root;
 const SelectGroup = SelectPrimitive.Group;
 const SelectValue = SelectPrimitive.Value;
 
+const selectTriggerStyles =
+  "flex w-fit items-center justify-between gap-2 rounded-lg border border-input bg-card px-3 text-sm text-foreground shadow-xs outline-none transition-[border-color,box-shadow,background-color] hover:border-border-strong focus:border-ring focus:ring-[3px] focus:ring-ring/20 disabled:opacity-50 data-[size=default]:h-9 data-[size=sm]:h-8";
+
 function SelectTrigger({
   className,
   size = "default",
@@ -20,10 +23,7 @@ function SelectTrigger({
     <SelectPrimitive.Trigger
       data-slot="select-trigger"
       data-size={size}
-      className={cn(
-        "flex w-fit items-center justify-between gap-2 rounded-lg border border-input bg-card px-3 text-sm text-foreground shadow-xs outline-none transition-[border-color,box-shadow,background-color] hover:border-border-strong focus:border-ring focus:ring-[3px] focus:ring-ring/20 disabled:opacity-50 data-[size=default]:h-9 data-[size=sm]:h-8",
-        className,
-      )}
+      className={cn(selectTriggerStyles, className)}
       {...props}
     >
       {children}
@@ -113,4 +113,5 @@ export {
   SelectContent,
   SelectLabel,
   SelectItem,
+  selectTriggerStyles,
 };

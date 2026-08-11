@@ -578,13 +578,83 @@ pub struct CaptureCredentialsRequest {
     pub profile_id: String,
 }
 
-/// Request to import the account active in a client's default configuration.
+/// Origin of one account candidate discovered in a client's current state.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderImportSource {
+    ActiveConfig,
+    OfficialCredential,
+}
+
+/// Whether a discovered candidate already has usable credential material.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderImportCredentialState {
+    Ready,
+    NeedsInput,
+    UnsupportedHelper,
+}
+
+/// Request to scan a client's current global configuration without changing it.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub struct ImportCurrentRequest {
+pub struct ProviderImportPreviewRequest {
     pub platform: Platform,
+}
+
+/// Non-secret account candidate returned by the import preview.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProviderImportCandidate {
+    pub candidate_id: String,
+    pub source: ProviderImportSource,
+    pub active: bool,
+    pub kind: ProviderKind,
     pub name: String,
     pub account_label: Option<String>,
+    pub base_url: Option<String>,
+    pub model: Option<String>,
+    pub custom_headers: Vec<HeaderEntry>,
+    pub user_agent: Option<String>,
+    pub platform_config: ProviderPlatformConfig,
+    pub secret_kind: SecretKind,
+    pub credential_state: ProviderImportCredentialState,
+    pub already_imported_provider_id: Option<String>,
+    pub warnings: Vec<String>,
+}
+
+/// Snapshot of all importable account sources at one point in time.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProviderImportPreview {
+    pub platform: Platform,
+    pub source_revision: String,
+    pub candidates: Vec<ProviderImportCandidate>,
+    pub warnings: Vec<String>,
+}
+
+/// One reviewed candidate selected for import.
+#[derive(Clone, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProviderImportSelection {
+    pub candidate_id: String,
+    pub provider: CreateProviderRequest,
+}
+
+/// Request to atomically import selected candidates from a prior preview.
+#[derive(Clone, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProviderImportCommitRequest {
+    pub platform: Platform,
+    pub source_revision: String,
+    pub selections: Vec<ProviderImportSelection>,
+}
+
+/// Providers created by one atomic import operation.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProviderImportResult {
+    pub profiles: Vec<ProviderProfile>,
 }
 
 /// Request to launch a managed profile in an optional working directory.

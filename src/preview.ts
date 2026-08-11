@@ -3,7 +3,6 @@ import type {
   AppSettings,
   BootstrapResponse,
   CreateProviderRequest,
-  ImportCurrentRequest,
   ModelFetchRequest,
   ModelFetchResponse,
   HistoryApplyRequest,
@@ -11,6 +10,10 @@ import type {
   HistoryPreview,
   HistoryPreviewRequest,
   OperationResult,
+  ProviderImportCommitRequest,
+  ProviderImportPreview,
+  ProviderImportPreviewRequest,
+  ProviderImportResult,
   ProviderProfile,
   UpdateProgress,
   UpdateProviderRequest,
@@ -229,27 +232,23 @@ const operation = async (message: string): Promise<OperationResult> => ({
   warning: null,
 });
 
-function profileFromRequest(
-  request: CreateProviderRequest | ImportCurrentRequest,
-): ProviderProfile {
-  const create = "kind" in request ? request : null;
+function profileFromRequest(request: CreateProviderRequest): ProviderProfile {
   return {
     id: crypto.randomUUID(),
     platform: request.platform,
-    kind: create?.kind ?? "official_subscription",
+    kind: request.kind,
     name: request.name,
     accountLabel: request.accountLabel,
-    baseUrl: create?.baseUrl ?? null,
-    model: create?.model ?? null,
-    customHeaders: create?.customHeaders ?? [],
-    userAgent: create?.userAgent ?? null,
-    platformConfig:
-      create?.platformConfig ?? emptyPlatformConfig(request.platform),
-    secretKind: create?.secretKind ?? "none",
-    hasSecret: Boolean(create?.secret),
-    profileHome: "/tmp/preview/new-profile",
+    baseUrl: request.baseUrl,
+    model: request.model,
+    customHeaders: request.customHeaders,
+    userAgent: request.userAgent,
+    platformConfig: request.platformConfig,
+    secretKind: request.secretKind,
+    hasSecret: Boolean(request.secret),
+    profileHome: null,
     status:
-      create?.kind === "official_subscription" && !create.officialCredential
+      request.kind === "official_subscription" && !request.officialCredential
         ? "needs_login"
         : "ready",
     createdAt: now,
@@ -412,11 +411,80 @@ export const previewApi = {
     profile.status = "ready";
     return operation("Credentials captured");
   },
-  importCurrent: async (request: ImportCurrentRequest) => {
-    const profile = profileFromRequest(request);
-    profile.status = "ready";
-    state.profiles.push(profile);
-    return operation("Current account imported");
+  previewProviderImport: async (
+    request: ProviderImportPreviewRequest,
+  ): Promise<ProviderImportPreview> => ({
+    platform: request.platform,
+    sourceRevision: `preview-${request.platform}`,
+    candidates: [
+      {
+        candidateId: "active_config",
+        source: "active_config",
+        active: true,
+        kind: "third_party",
+        name: request.platform === "codex" ? "OpenRouter" : "Team Gateway",
+        accountLabel: "Current configuration",
+        baseUrl: "https://gateway.example.com/v1",
+        model: request.platform === "codex" ? "gpt-5.6-sol" : "claude-sonnet-5",
+        customHeaders: [{ name: "X-Team", value: "engineering" }],
+        userAgent: "YAAT Preview",
+        platformConfig:
+          request.platform === "codex"
+            ? {
+                platform: "codex" as const,
+                defaultModel: "gpt-5.6-sol",
+                catalog: [],
+              }
+            : request.platform === "claude_code"
+              ? {
+                  platform: "claude_code" as const,
+                  defaultModel: "claude-sonnet-5",
+                  sonnet: "claude-sonnet-5",
+                  opus: "claude-opus-5",
+                  haiku: "claude-haiku-4-5",
+                  fable: "claude-fable-4-5",
+                  subagent: "claude-haiku-4-5",
+                }
+              : {
+                  platform: "claude_desktop",
+                  models: ["claude-sonnet-5"],
+                },
+        secretKind: "bearer_token",
+        credentialState: "ready",
+        alreadyImportedProviderId: null,
+        warnings: [],
+      },
+      {
+        candidateId: "official_credential",
+        source: "official_credential",
+        active: false,
+        kind: "official_subscription",
+        name: request.platform === "codex" ? "OpenAI" : "Claude",
+        accountLabel: "signed-in@example.com",
+        baseUrl: null,
+        model: null,
+        customHeaders: [],
+        userAgent: null,
+        platformConfig: emptyPlatformConfig(request.platform),
+        secretKind: "none",
+        credentialState: "ready",
+        alreadyImportedProviderId: null,
+        warnings: [],
+      },
+    ],
+    warnings: [],
+  }),
+  commitProviderImport: async (
+    request: ProviderImportCommitRequest,
+  ): Promise<ProviderImportResult> => {
+    const profiles = request.selections.map(({ provider }) => {
+      const profile = profileFromRequest(provider);
+      profile.status = "ready";
+      profile.hasSecret = provider.kind !== "official_subscription";
+      state.profiles.push(profile);
+      return profile;
+    });
+    return { profiles: copy(profiles) };
   },
   queryUsage: async (request: UsageQueryRequest) => usage(request),
   updateSettings: async (settings: AppSettings) => {
