@@ -5,6 +5,7 @@ export type ProviderKind =
 export type ActivationMode = "managed_launch" | "global_credential";
 export type SecretKind = "none" | "api_key" | "bearer_token";
 export type ProfileStatus = "ready" | "needs_login";
+export type CliStatus = "ready" | "version_unknown" | "invalid" | "missing";
 export type ReasoningEffort =
   "none" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max" | "ultra";
 
@@ -72,9 +73,10 @@ export interface PlatformBinding {
 
 export interface PlatformState {
   platform: Platform;
-  cliFound: boolean;
+  cliStatus: CliStatus;
   cliPath: string | null;
   cliVersion: string | null;
+  cliError: string | null;
   configRoot: string;
   binding: PlatformBinding;
 }

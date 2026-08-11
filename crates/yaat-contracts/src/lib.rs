@@ -260,14 +260,26 @@ pub struct PlatformBinding {
     pub last_managed_profile_id: Option<String>,
 }
 
+/// Health of a configured or automatically discovered client executable.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CliStatus {
+    Ready,
+    VersionUnknown,
+    Invalid,
+    #[default]
+    Missing,
+}
+
 /// Runtime discovery state and binding information for one platform.
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PlatformState {
     pub platform: Platform,
-    pub cli_found: bool,
+    pub cli_status: CliStatus,
     pub cli_path: Option<String>,
     pub cli_version: Option<String>,
+    pub cli_error: Option<String>,
     pub config_root: String,
     pub binding: PlatformBinding,
 }

@@ -223,6 +223,20 @@ export default function App() {
 
   const platformState =
     data?.platforms.find((item) => item.platform === platform) ?? null;
+  const platformExecutableReady = platformState?.cliStatus === "ready";
+  const platformExecutableUnknown =
+    platformState?.cliStatus === "version_unknown";
+  const platformDiagnostic = platformState
+    ? [
+        platformState.cliVersion ||
+          platformState.cliPath ||
+          (platform === "claude_desktop" ? "Claude Desktop" : "CLI"),
+        platformState.cliStatus === "ready" ? null : platformState.cliError,
+        platformState.configRoot,
+      ]
+        .filter(Boolean)
+        .join(" · ")
+    : null;
   const platformUsage = usage?.platform === platform ? usage : null;
   const profiles = useMemo(
     () =>
@@ -551,32 +565,45 @@ export default function App() {
                   </h1>
                   {platformState ? (
                     <Badge
-                      variant={platformState.cliFound ? "success" : "warning"}
+                      variant={platformExecutableReady ? "success" : "warning"}
+                      title={platformState.cliError ?? undefined}
                     >
                       <span
                         className={cn(
                           "size-1.5 rounded-full",
-                          platformState.cliFound
+                          platformExecutableReady
                             ? "bg-emerald-500"
-                            : "bg-amber-500",
+                            : platformExecutableUnknown
+                              ? "bg-amber-500"
+                              : "bg-destructive",
                         )}
                       />
                       {t(
                         platform === "claude_desktop"
-                          ? platformState.cliFound
+                          ? platformExecutableReady
                             ? "appReady"
-                            : "appMissing"
-                          : platformState.cliFound
+                            : platformExecutableUnknown
+                              ? "appVersionUnknown"
+                              : platformState.cliStatus === "invalid"
+                                ? "appInvalid"
+                                : "appMissing"
+                          : platformExecutableReady
                             ? "cliReady"
-                            : "cliMissing",
+                            : platformExecutableUnknown
+                              ? "cliVersionUnknown"
+                              : platformState.cliStatus === "invalid"
+                                ? "cliInvalid"
+                                : "cliMissing",
                       )}
                     </Badge>
                   ) : null}
                 </div>
                 {platformState ? (
-                  <p className="mt-2 text-xs text-muted-foreground/75">
-                    {platformState.cliVersion || platformState.cliPath || "CLI"}{" "}
-                    · {platformState.configRoot}
+                  <p
+                    className="mt-2 truncate text-xs text-muted-foreground/75"
+                    title={platformDiagnostic ?? undefined}
+                  >
+                    {platformDiagnostic}
                   </p>
                 ) : null}
               </div>

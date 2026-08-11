@@ -19,7 +19,7 @@ use tauri::{AppHandle, State, ipc::Channel};
 use uuid::Uuid;
 use yaat_contracts::{
     ActivateProviderRequest, ActivationMode, ApiError, AppSettings, BootstrapResponse,
-    CaptureCredentialsRequest, CreateProviderRequest, DeactivateGlobalRequest,
+    CaptureCredentialsRequest, CliStatus, CreateProviderRequest, DeactivateGlobalRequest,
     DeleteProviderRequest, HistoryApplyRequest, HistoryApplyResult, HistoryPreview,
     HistoryPreviewRequest, HistoryScope, HistorySyncState, HistorySyncStatus, LaunchRequest,
     LoginRequest, ModelFetchRequest, ModelFetchResponse, OperationProgress, OperationResult,
@@ -1418,20 +1418,42 @@ fn bootstrap_inner(state: &AppState) -> AppResult<BootstrapResponse> {
     let mut platforms = Vec::with_capacity(Platform::ALL.len());
     for platform in Platform::ALL {
         let context = state.context(platform, &settings);
-        let discovered = state.adapter(platform).discover_cli(&context);
-        let (cli_found, cli_path, cli_version) = match discovered {
-            Ok((path, version)) => (
-                true,
-                Some(path.to_string_lossy().into_owned()),
-                Some(version),
-            ),
-            Err(_) => (false, None, None),
-        };
+        let (cli_status, cli_path, cli_version, cli_error) =
+            match state.adapter(platform).resolve_cli(&context) {
+                Ok(path) => match state.adapter(platform).cli_version(&path) {
+                    Ok(version) => (
+                        CliStatus::Ready,
+                        Some(path.to_string_lossy().into_owned()),
+                        Some(version),
+                        None,
+                    ),
+                    Err(error) => (
+                        CliStatus::VersionUnknown,
+                        Some(path.to_string_lossy().into_owned()),
+                        None,
+                        Some(cli_error_summary(&error)),
+                    ),
+                },
+                Err(error) => (
+                    if context.explicit_cli_path.is_some() {
+                        CliStatus::Invalid
+                    } else {
+                        CliStatus::Missing
+                    },
+                    context
+                        .explicit_cli_path
+                        .as_ref()
+                        .map(|path| path.to_string_lossy().into_owned()),
+                    None,
+                    Some(cli_error_summary(&error)),
+                ),
+            };
         platforms.push(PlatformState {
             platform,
-            cli_found,
+            cli_status,
             cli_path,
             cli_version,
+            cli_error,
             config_root: state
                 .config_root(platform, &settings)?
                 .to_string_lossy()
@@ -1451,6 +1473,14 @@ fn bootstrap_inner(state: &AppState) -> AppResult<BootstrapResponse> {
             .list_history_sync_status()
             .map_err(AppError::from)?,
     })
+}
+
+fn cli_error_summary(error: &str) -> String {
+    error
+        .chars()
+        .filter(|character| !character.is_control())
+        .take(512)
+        .collect()
 }
 
 fn provider_create_inner(
@@ -1572,12 +1602,14 @@ fn provider_capture_inner(state: &AppState, profile_id: &str) -> AppResult<Opera
     let settings = state.repository.load_settings().map_err(AppError::from)?;
     let context = state.context(profile.platform, &settings);
     let home = paths::managed_profile_home(profile.platform, &profile.id)?;
+    let global_root = state.config_root(profile.platform, &settings)?;
+    let capture_root = credential_capture_root(globally_active, &global_root, &home);
     if profile.platform == Platform::ClaudeDesktop {
         process::ensure_claude_desktop_is_stopped()?;
     }
     let snapshot = state
         .adapter(profile.platform)
-        .capture_credentials(&context, &home)
+        .capture_credentials(&context, capture_root)
         .map_err(AppError::Credential)?;
     let warning = snapshot.warning.clone();
     store_snapshot(state, &profile.id, &snapshot)?;
@@ -1598,6 +1630,18 @@ fn provider_capture_inner(state: &AppState, profile_id: &str) -> AppResult<Opera
         return Err(with_provider_update_rollback(error, &rollback));
     }
     Ok(operation("credentials captured", warning))
+}
+
+fn credential_capture_root<'a>(
+    globally_active: bool,
+    global_root: &'a Path,
+    profile_home: &'a Path,
+) -> &'a Path {
+    if globally_active {
+        global_root
+    } else {
+        profile_home
+    }
 }
 
 enum ImportCredential {
@@ -2628,6 +2672,15 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+
+    #[test]
+    fn active_account_refresh_reads_the_global_credential_slot() {
+        let global = Path::new("/Users/example/.codex");
+        let profile = Path::new("/Users/example/.yaat/profiles/codex/account/home");
+
+        assert_eq!(credential_capture_root(true, global, profile), global);
+        assert_eq!(credential_capture_root(false, global, profile), profile);
+    }
 
     #[test]
     fn import_preview_redacts_discovered_credentials_but_revision_tracks_them() {

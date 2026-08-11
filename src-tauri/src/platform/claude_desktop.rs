@@ -151,7 +151,7 @@ impl ClaudeDesktopAdapter {
         runtime: ProfileRuntime<'_>,
     ) -> Result<CommandSpec, String> {
         let root = self.prepare_profile(context, runtime.clone())?;
-        let (program, _) = self.discover_cli(context)?;
+        let program = self.resolve_cli(context)?;
         let env = BTreeMap::from([(
             USER_DATA_ENV.to_string(),
             root.to_string_lossy().into_owned(),
@@ -262,7 +262,7 @@ fn prepare_gateway_config(
 }
 
 impl PlatformAdapter for ClaudeDesktopAdapter {
-    fn discover_cli(&self, context: &AdapterContext) -> Result<(PathBuf, String), String> {
+    fn resolve_cli(&self, context: &AdapterContext) -> Result<PathBuf, String> {
         let program = match context.explicit_cli_path.as_ref() {
             Some(path) => path.clone(),
             None => default_executable()?,
@@ -275,8 +275,12 @@ impl PlatformAdapter for ClaudeDesktopAdapter {
         if !metadata.file_type().is_file() {
             return Err("configured Claude Desktop executable must be a regular file".into());
         }
+        Ok(program)
+    }
+
+    fn cli_version(&self, path: &Path) -> Result<String, String> {
         let (status, stdout, _) =
-            crate::process::run_with_timeout(&program, &["--version"], Duration::from_secs(3))?;
+            crate::process::run_with_timeout(path, &["--version"], Duration::from_secs(3))?;
         if !status.success() {
             return Err("Claude Desktop --version exited unsuccessfully".into());
         }
@@ -287,7 +291,7 @@ impl PlatformAdapter for ClaudeDesktopAdapter {
         if version.is_empty() || version.len() > 128 || version.chars().any(char::is_control) {
             return Err("Claude Desktop returned an invalid version".into());
         }
-        Ok((program, version))
+        Ok(version)
     }
 
     fn prepare_profile(

@@ -211,10 +211,12 @@ impl CodexAdapter {
 }
 
 impl PlatformAdapter for CodexAdapter {
-    fn discover_cli(&self, context: &AdapterContext) -> Result<(PathBuf, String), String> {
-        let path = resolve_cli_path(context)?;
-        let version = read_cli_version(&path)?;
-        Ok((path, version))
+    fn resolve_cli(&self, context: &AdapterContext) -> Result<PathBuf, String> {
+        resolve_cli_path(context)
+    }
+
+    fn cli_version(&self, path: &Path) -> Result<String, String> {
+        read_cli_version(path)
     }
 
     fn prepare_profile(
@@ -262,7 +264,7 @@ impl PlatformAdapter for CodexAdapter {
             );
         }
         let profile_home = self.prepare_profile(context, runtime)?;
-        let (program, _) = self.discover_cli(context)?;
+        let program = self.resolve_cli(context)?;
         let mut args = vec!["login".into()];
         if console {
             args.push("--device-auth".into());
@@ -278,7 +280,7 @@ impl PlatformAdapter for CodexAdapter {
         passthrough_args: Vec<String>,
     ) -> Result<CommandSpec, String> {
         let profile_home = self.prepare_profile(context, runtime)?;
-        let (program, _) = self.discover_cli(context)?;
+        let program = self.resolve_cli(context)?;
         Ok(codex_command_spec(
             program,
             passthrough_args,
@@ -903,36 +905,10 @@ fn codex_command_spec(
 }
 
 fn resolve_cli_path(context: &AdapterContext) -> Result<PathBuf, String> {
-    let path = if let Some(explicit) = context.explicit_cli_path.as_ref() {
-        if explicit.components().count() == 1 {
-            which::which(explicit).map_err(|error| {
-                format!(
-                    "configured Codex CLI `{}` was not found: {error}",
-                    explicit.display()
-                )
-            })?
-        } else {
-            explicit.clone()
-        }
-    } else {
-        which::which("codex")
-            .map_err(|error| format!("Codex CLI was not found in PATH: {error}"))?
-    };
-
-    let metadata = fs::metadata(&path)
-        .map_err(|error| format!("Codex CLI {} is unavailable: {error}", path.display()))?;
-    if !metadata.is_file() {
-        return Err(format!("Codex CLI {} is not a file", path.display()));
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        if metadata.permissions().mode() & 0o111 == 0 {
-            return Err(format!("Codex CLI {} is not executable", path.display()));
-        }
-    }
-    path.canonicalize()
-        .map_err(|error| format!("failed to resolve Codex CLI {}: {error}", path.display()))
+    super::executable::resolve(
+        super::executable::CliProgram::Codex,
+        context.explicit_cli_path.as_deref(),
+    )
 }
 
 fn read_cli_version(path: &Path) -> Result<String, String> {

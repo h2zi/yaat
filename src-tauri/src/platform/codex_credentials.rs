@@ -1024,28 +1024,10 @@ fn resolve_backend(
 }
 
 fn resolve_cli_path(context: &AdapterContext) -> Result<PathBuf, String> {
-    let path = if let Some(explicit) = context.explicit_cli_path.as_ref() {
-        if explicit.components().count() == 1 {
-            which::which(explicit).map_err(|error| {
-                format!(
-                    "configured Codex CLI `{}` was not found: {error}",
-                    explicit.display()
-                )
-            })?
-        } else {
-            explicit.clone()
-        }
-    } else {
-        which::which("codex")
-            .map_err(|error| format!("Codex CLI was not found in PATH: {error}"))?
-    };
-    let metadata = fs::metadata(&path)
-        .map_err(|error| format!("Codex CLI {} is unavailable: {error}", path.display()))?;
-    if !metadata.is_file() {
-        return Err(format!("Codex CLI {} is not a file", path.display()));
-    }
-    path.canonicalize()
-        .map_err(|error| format!("failed to resolve Codex CLI {}: {error}", path.display()))
+    super::executable::resolve(
+        super::executable::CliProgram::Codex,
+        context.explicit_cli_path.as_deref(),
+    )
 }
 
 fn run_codex(

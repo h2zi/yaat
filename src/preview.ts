@@ -140,9 +140,10 @@ let state: BootstrapResponse = {
   platforms: [
     {
       platform: "codex",
-      cliFound: true,
+      cliStatus: "ready",
       cliPath: "/usr/local/bin/codex",
       cliVersion: "codex-cli 0.147.0",
+      cliError: null,
       configRoot: "~/.codex",
       binding: {
         platform: "codex",
@@ -152,9 +153,10 @@ let state: BootstrapResponse = {
     },
     {
       platform: "claude_code",
-      cliFound: true,
+      cliStatus: "ready",
       cliPath: "/usr/local/bin/claude",
       cliVersion: "Claude Code 2.1.226",
+      cliError: null,
       configRoot: "~/.claude",
       binding: {
         platform: "claude_code",
@@ -164,9 +166,10 @@ let state: BootstrapResponse = {
     },
     {
       platform: "claude_desktop",
-      cliFound: true,
+      cliStatus: "ready",
       cliPath: "/Applications/Claude.app/Contents/MacOS/Claude",
       cliVersion: "1.26832.0",
+      cliError: null,
       configRoot: "~/Library/Application Support/Claude",
       binding: {
         platform: "claude_desktop",

@@ -10,7 +10,7 @@ publish = false
 base64 = "=0.22.1"
 directories = "=6.0.0"
 hex = "=0.4.3"
-jsonc-parser = { version = "=0.33.1", features = ["cst"] }
+jsonc-parser = { version = "=0.33.1", features = ["cst", "serde"] }
 keyring = { version = "=4.1.6", features = ["apple-native-keyring-store", "windows-native-keyring-store"] }
 serde = { version = "=1.0.229", features = ["derive"] }
 serde_json = "=1.0.151"

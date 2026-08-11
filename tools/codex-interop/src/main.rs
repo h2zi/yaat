@@ -19,7 +19,11 @@ use std::time::Duration;
 use base64::Engine as _;
 use tempfile::TempDir;
 use toml_edit::DocumentMut;
-use yaat_contracts::{Platform, ProfileStatus, ProviderKind, ProviderProfile, SecretKind};
+use yaat_contracts::{
+    HeaderEntry, Platform, ProfileStatus, ProviderImportCredentialState, ProviderKind,
+    ProviderPlatformConfig, ProviderProfile, SecretKind,
+};
+use zeroize::Zeroizing;
 
 #[path = "../../../src-tauri/src/activation/mod.rs"]
 mod activation;
@@ -138,6 +142,13 @@ mod platform {
     use super::*;
     use serde::{Deserialize, Serialize};
 
+    pub(super) mod executable {
+        include!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../src-tauri/src/platform/executable.rs"
+        ));
+    }
+
     pub(super) mod codex_credentials {
         include!(concat!(
             env!("CARGO_MANIFEST_DIR"),
@@ -200,8 +211,32 @@ mod platform {
         pub contents: Option<Vec<u8>>,
     }
 
+    pub struct DiscoveredProvider {
+        pub candidate_id: String,
+        pub kind: ProviderKind,
+        pub name: String,
+        pub account_label: Option<String>,
+        pub base_url: Option<String>,
+        pub model: Option<String>,
+        pub custom_headers: Vec<HeaderEntry>,
+        pub user_agent: Option<String>,
+        pub platform_config: ProviderPlatformConfig,
+        pub secret_kind: SecretKind,
+        pub secret: Option<Zeroizing<String>>,
+        pub credential_state: ProviderImportCredentialState,
+        pub warnings: Vec<String>,
+    }
+
     pub trait PlatformAdapter: Send + Sync {
-        fn discover_cli(&self, context: &AdapterContext) -> Result<(PathBuf, String), String>;
+        fn resolve_cli(&self, context: &AdapterContext) -> Result<PathBuf, String>;
+        fn cli_version(&self, path: &Path) -> Result<String, String>;
+        fn discover_import_provider(
+            &self,
+            _context: &AdapterContext,
+            _config_root: &Path,
+        ) -> Result<Option<DiscoveredProvider>, String> {
+            Ok(None)
+        }
         fn prepare_profile(
             &self,
             context: &AdapterContext,

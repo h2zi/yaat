@@ -9,6 +9,7 @@ mod claude_desktop_safe_storage;
 /// Codex integration.
 pub mod codex;
 mod codex_credentials;
+mod executable;
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -135,7 +136,8 @@ pub struct DiscoveredProvider {
 }
 
 pub trait PlatformAdapter: Send + Sync {
-    fn discover_cli(&self, context: &AdapterContext) -> Result<(PathBuf, String), String>;
+    fn resolve_cli(&self, context: &AdapterContext) -> Result<PathBuf, String>;
+    fn cli_version(&self, path: &std::path::Path) -> Result<String, String>;
     fn prepare_profile(
         &self,
         context: &AdapterContext,

@@ -321,34 +321,12 @@ pub(crate) fn ensure_global_credential_namespace() -> Result<(), String> {
 }
 
 impl PlatformAdapter for ClaudeAdapter {
-    fn discover_cli(&self, context: &AdapterContext) -> Result<(PathBuf, String), String> {
-        let program = match &context.explicit_cli_path {
-            Some(path) => path.clone(),
-            None => which::which("claude")
-                .map_err(|_| "Claude Code CLI was not found on PATH".to_string())?,
-        };
+    fn resolve_cli(&self, context: &AdapterContext) -> Result<PathBuf, String> {
+        resolve_cli_path(context)
+    }
 
-        let metadata = fs::metadata(&program)
-            .map_err(|_| "configured Claude Code CLI path is not readable".to_string())?;
-        if !metadata.is_file() {
-            return Err("configured Claude Code CLI path is not a file".into());
-        }
-
-        let (status, stdout, stderr) =
-            crate::process::run_with_timeout(&program, &["--version"], Duration::from_secs(3))?;
-        if !status.success() {
-            return Err("`claude --version` exited unsuccessfully".into());
-        }
-        let text = if stdout.is_empty() {
-            String::from_utf8(stderr)
-                .map_err(|_| "Claude Code version output is not UTF-8".to_string())?
-        } else {
-            String::from_utf8(stdout)
-                .map_err(|_| "Claude Code version output is not UTF-8".to_string())?
-        };
-        let version = parse_cli_version(&text)
-            .ok_or_else(|| "unable to parse Claude Code CLI version".to_string())?;
-        Ok((program, version.to_string()))
+    fn cli_version(&self, path: &Path) -> Result<String, String> {
+        read_cli_version(path)
     }
 
     fn prepare_profile(
@@ -390,7 +368,7 @@ impl PlatformAdapter for ClaudeAdapter {
         }
         let use_console = console || runtime.profile.kind == ProviderKind::OfficialApi;
         let config_root = self.prepare_profile(context, runtime)?;
-        let (program, _) = self.discover_cli(context)?;
+        let program = self.resolve_cli(context)?;
         managed_command_spec(
             program,
             vec![
@@ -415,7 +393,7 @@ impl PlatformAdapter for ClaudeAdapter {
         passthrough_args: Vec<String>,
     ) -> Result<CommandSpec, String> {
         let config_root = self.prepare_profile(context, runtime)?;
-        let (program, _) = self.discover_cli(context)?;
+        let program = self.resolve_cli(context)?;
         managed_command_spec(program, passthrough_args, config_root, cwd)
     }
 
@@ -667,6 +645,31 @@ fn managed_command_spec(
             .collect(),
         cwd,
     })
+}
+
+fn resolve_cli_path(context: &AdapterContext) -> Result<PathBuf, String> {
+    super::executable::resolve(
+        super::executable::CliProgram::ClaudeCode,
+        context.explicit_cli_path.as_deref(),
+    )
+}
+
+fn read_cli_version(path: &Path) -> Result<String, String> {
+    let (status, stdout, stderr) =
+        crate::process::run_with_timeout(path, &["--version"], Duration::from_secs(3))?;
+    if !status.success() {
+        return Err("`claude --version` exited unsuccessfully".into());
+    }
+    let text = if stdout.is_empty() {
+        String::from_utf8(stderr)
+            .map_err(|_| "Claude Code version output is not UTF-8".to_string())?
+    } else {
+        String::from_utf8(stdout)
+            .map_err(|_| "Claude Code version output is not UTF-8".to_string())?
+    };
+    parse_cli_version(&text)
+        .map(str::to_owned)
+        .ok_or_else(|| "unable to parse Claude Code CLI version".to_string())
 }
 
 fn parse_cli_version(output: &str) -> Option<&str> {
@@ -1302,6 +1305,16 @@ fn extract_account_snapshot_optional(payload: &[u8]) -> Result<Option<Vec<u8>>, 
             snapshot.insert((*field).to_string(), value.clone());
         }
     }
+    if let Some(oauth) = snapshot.get("claudeAiOauth")
+        && !oauth_has_usable_token(oauth)?
+    {
+        // Claude Code may leave an empty OAuth metadata shell after logout or
+        // while a direct provider is active. It is not an account credential
+        // and must not prevent YAAT from switching to a saved official account.
+        snapshot.remove("claudeAiOauth");
+        snapshot.remove("organizationUuid");
+        snapshot.remove("trustedDeviceToken");
+    }
     let snapshot = SensitiveJson(Value::Object(snapshot));
     validate_account_object(snapshot.object(), false)?;
     if snapshot.object().get("claudeAiOauth").is_none()
@@ -1336,19 +1349,10 @@ fn validate_account_object(object: &Map<String, Value>, require_auth: bool) -> R
             "Claude account snapshot contains no supported first-party authentication".into(),
         );
     }
-    if let Some(oauth) = oauth {
-        let oauth = oauth
-            .as_object()
-            .ok_or_else(|| "Claude OAuth credential must be a JSON object".to_string())?;
-        for field in ["accessToken", "refreshToken"] {
-            if oauth
-                .get(field)
-                .and_then(Value::as_str)
-                .is_none_or(str::is_empty)
-            {
-                return Err(format!("Claude OAuth credential is missing `{field}`"));
-            }
-        }
+    if let Some(oauth) = oauth
+        && !oauth_has_usable_token(oauth)?
+    {
+        return Err("Claude OAuth credential contains no usable access or refresh token".into());
     }
     if let Some(gateway) = gateway {
         let gateway = gateway.as_object().ok_or_else(|| {
@@ -1367,6 +1371,22 @@ fn validate_account_object(object: &Map<String, Value>, require_auth: bool) -> R
         }
     }
     Ok(())
+}
+
+fn oauth_has_usable_token(value: &Value) -> Result<bool, String> {
+    let oauth = value
+        .as_object()
+        .ok_or_else(|| "Claude OAuth credential must be a JSON object".to_string())?;
+    let token_present = |field: &str| match oauth.get(field) {
+        Some(Value::String(value)) => Ok(!value.is_empty()),
+        Some(_) => Err(format!(
+            "Claude OAuth credential `{field}` must be a string"
+        )),
+        None => Ok(false),
+    };
+    let access_token = token_present("accessToken")?;
+    let refresh_token = token_present("refreshToken")?;
+    Ok(access_token || refresh_token)
 }
 
 fn account_label_from_snapshot(payload: &[u8]) -> Result<Option<String>, String> {
@@ -2593,6 +2613,84 @@ mod tests {
         ] {
             assert!(value.get(field).is_none(), "snapshot leaked {field}");
         }
+    }
+
+    #[test]
+    fn empty_oauth_shell_is_absent_during_optional_capture() {
+        let payload = serde_json::to_vec(&serde_json::json!({
+            "claudeAiOauth": {
+                "accessToken": "",
+                "refreshToken": "",
+                "expiresAt": 0,
+                "subscriptionType": "pro"
+            },
+            "organizationUuid": "stale-org",
+            "trustedDeviceToken": "stale-device",
+            "mcpOAuth": {"server": "unowned"}
+        }))
+        .unwrap();
+
+        assert!(
+            extract_account_snapshot_optional(&payload)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn empty_oauth_residue_does_not_block_switching_to_saved_official_account() {
+        let current = serde_json::to_vec(&serde_json::json!({
+            "claudeAiOauth": {
+                "accessToken": "",
+                "refreshToken": "",
+                "expiresAt": 0
+            },
+            "mcpOAuth": {"server": "keep"}
+        }))
+        .unwrap();
+        assert!(
+            extract_account_snapshot_optional(&current)
+                .unwrap()
+                .is_none()
+        );
+
+        let target = account_snapshot("official");
+        let merged = merge_account_fields(&current, &target, true).unwrap();
+        let merged: Value = serde_json::from_slice(&merged).unwrap();
+        assert_eq!(merged["claudeAiOauth"]["accessToken"], "access-official");
+        assert_eq!(merged["mcpOAuth"]["server"], "keep");
+    }
+
+    #[test]
+    fn refresh_token_only_is_a_restorable_oauth_snapshot() {
+        let payload = serde_json::to_vec(&serde_json::json!({
+            "claudeAiOauth": {
+                "accessToken": "",
+                "refreshToken": "refresh-a",
+                "expiresAt": 0
+            }
+        }))
+        .unwrap();
+
+        let snapshot = extract_account_snapshot(&payload).unwrap();
+        validate_account_snapshot(&snapshot).unwrap();
+    }
+
+    #[test]
+    fn oauth_snapshot_rejects_when_both_tokens_are_empty() {
+        let payload = serde_json::to_vec(&serde_json::json!({
+            "claudeAiOauth": {
+                "accessToken": "",
+                "refreshToken": ""
+            }
+        }))
+        .unwrap();
+
+        assert!(
+            validate_account_snapshot(&payload)
+                .unwrap_err()
+                .contains("no usable access or refresh token")
+        );
     }
 
     #[test]
