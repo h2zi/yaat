@@ -255,7 +255,10 @@ impl ClaudeAdapter {
                         if model.trim().is_empty() || model.chars().any(char::is_control) {
                             return Err("Claude model identifier is invalid".into());
                         }
-                        (Some(base_url.to_string()), Some(model.to_string()))
+                        (
+                            Some(claude_code_base_url(base_url).to_string()),
+                            Some(model.to_string()),
+                        )
                     }
                     ProviderKind::OfficialSubscription => unreachable!(),
                 };
@@ -325,6 +328,11 @@ impl ClaudeAdapter {
         }
         crate::paths::default_config_root(Platform::ClaudeCode).map_err(|error| error.to_string())
     }
+}
+
+fn claude_code_base_url(value: &str) -> &str {
+    let value = value.trim().trim_end_matches('/');
+    value.strip_suffix("/v1").unwrap_or(value)
 }
 
 pub(crate) fn ensure_global_credential_namespace() -> Result<(), String> {
@@ -2564,10 +2572,10 @@ mod tests {
         .unwrap();
 
         let mut profile = profile(ProviderKind::ThirdParty);
-        profile.base_url = Some("https://gateway.example.com".into());
-        profile.model = Some("upstream-default".into());
+        profile.base_url = Some("https://gateway.example.com/api/v1/".into());
+        profile.model = Some("upstream-default[1m]".into());
         profile.platform_config = ProviderPlatformConfig::ClaudeCode {
-            default_model: Some("upstream-default".into()),
+            default_model: Some("upstream-default[1m]".into()),
             sonnet: Some("upstream-sonnet".into()),
             opus: Some("upstream-opus".into()),
             haiku: Some("upstream-haiku".into()),
@@ -2593,6 +2601,9 @@ mod tests {
         let patched: Value =
             serde_json::from_str(&fs::read_to_string(&plan.path).unwrap()).unwrap();
         let env = patched["env"].as_object().unwrap();
+
+        assert_eq!(env["ANTHROPIC_BASE_URL"], "https://gateway.example.com/api");
+        assert_eq!(env["ANTHROPIC_MODEL"], "upstream-default[1m]");
 
         for (role, model) in [
             ("SONNET", "upstream-sonnet"),

@@ -295,6 +295,7 @@ export function ProviderDialog({
   const title =
     titleOverride ??
     (mode === "create" ? t("dialogCreateTitle") : t("dialogEditTitle"));
+  const fetchedModelListId = `provider-model-options-${platform}`;
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
@@ -391,7 +392,11 @@ export function ProviderDialog({
                   type="url"
                   value={baseUrl}
                   onChange={(event) => setBaseUrl(event.target.value)}
-                  placeholder="https://api.example.com/v1"
+                  placeholder={
+                    platform === "claude_code"
+                      ? "https://api.example.com"
+                      : "https://api.example.com/v1"
+                  }
                 />
                 {baseUrl.trim().toLowerCase().startsWith("http://") ? (
                   <p className="text-xs text-amber-700 dark:text-amber-300">
@@ -553,12 +558,30 @@ export function ProviderDialog({
                 <div className="flex gap-2">
                   <Input
                     id="model"
+                    list={
+                      fetchedModels.some((entry) => entry.directCompatible)
+                        ? fetchedModelListId
+                        : undefined
+                    }
                     value={model}
                     onChange={(event) => setModel(event.target.value)}
                     placeholder={
                       platform === "codex" ? "gpt-5.1-codex" : "claude-sonnet-5"
                     }
                   />
+                  {fetchedModels.length ? (
+                    <datalist id={fetchedModelListId}>
+                      {fetchedModels.map((entry) => (
+                        <option
+                          key={entry.id}
+                          value={entry.id}
+                          disabled={!entry.directCompatible}
+                        >
+                          {entry.warning ? t("routingRequired") : entry.id}
+                        </option>
+                      ))}
+                    </datalist>
+                  ) : null}
                   <Button
                     type="button"
                     variant="outline"
@@ -575,25 +598,6 @@ export function ProviderDialog({
                     {t("fetchModels")}
                   </Button>
                 </div>
-                {fetchedModels.length ? (
-                  <Select value={model || undefined} onValueChange={setModel}>
-                    <SelectTrigger className="w-full">
-                      <SelectValue placeholder={t("chooseFetchedModel")} />
-                    </SelectTrigger>
-                    <SelectContent>
-                      {fetchedModels.map((entry) => (
-                        <SelectItem
-                          key={entry.id}
-                          value={entry.id}
-                          disabled={!entry.directCompatible}
-                        >
-                          {entry.id}
-                          {entry.warning ? ` · ${t("routingRequired")}` : ""}
-                        </SelectItem>
-                      ))}
-                    </SelectContent>
-                  </Select>
-                ) : null}
               </div>
 
               {platformConfig.platform === "claude_code" ? (

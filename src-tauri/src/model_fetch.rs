@@ -329,6 +329,32 @@ mod tests {
     }
 
     #[test]
+    fn adds_v1_when_fetching_claude_code_models_from_a_client_base_url() {
+        let (base_url, received) = mock_server(vec![MockResponse {
+            status: "200 OK",
+            body: serde_json::json!({
+                "data": [{"id": "claude-sonnet-4-5"}]
+            })
+            .to_string(),
+        }]);
+        let response = tauri::async_runtime::block_on(fetch(&request(
+            Platform::ClaudeCode,
+            format!("{base_url}/"),
+            SecretKind::ApiKey,
+        )))
+        .unwrap();
+
+        assert_eq!(response.models[0].id, "claude-sonnet-4-5");
+        let requests = received.recv().unwrap();
+        assert!(requests[0].starts_with("GET /v1/models HTTP/1.1"));
+        assert!(
+            requests[0]
+                .to_ascii_lowercase()
+                .contains("x-api-key: discovery-secret")
+        );
+    }
+
+    #[test]
     fn falls_back_to_base_models_and_marks_desktop_routing_requirements() {
         let (base_url, received) = mock_server(vec![
             MockResponse {
