@@ -812,8 +812,13 @@ mod tests {
             &[UsageRoot { path: root.clone() }],
         )
         .unwrap();
+        let scanned_path = jsonl_files(&root.join("sessions"), true)
+            .into_iter()
+            .next()
+            .unwrap();
+        let (source_path, _, _) = source_metadata(&scanned_path).unwrap();
         let first_state = repository
-            .usage_source_state(Platform::Codex, &path.to_string_lossy())
+            .usage_source_state(Platform::Codex, &source_path)
             .unwrap()
             .unwrap();
 
@@ -827,10 +832,10 @@ mod tests {
         )
         .unwrap();
         drop(file);
-        let (_, file_size, modified_at) = source_metadata(&path).unwrap();
+        let (_, file_size, modified_at) = source_metadata(&scanned_path).unwrap();
         let (increment, _) = scan_codex_source(
-            &path,
-            &path.to_string_lossy(),
+            &scanned_path,
+            &source_path,
             file_size,
             modified_at,
             Some(&first_state),
@@ -844,7 +849,7 @@ mod tests {
             .usage_rows(Platform::Codex, 0, i64::MAX, None)
             .unwrap();
         let state = repository
-            .usage_source_state(Platform::Codex, &path.to_string_lossy())
+            .usage_source_state(Platform::Codex, &source_path)
             .unwrap()
             .unwrap();
 
@@ -900,8 +905,13 @@ mod tests {
             &[UsageRoot { path: root.clone() }],
         )
         .unwrap();
+        let scanned_path = jsonl_files(&root.join("projects"), false)
+            .into_iter()
+            .next()
+            .unwrap();
+        let (source_path, _, _) = source_metadata(&scanned_path).unwrap();
         let first_state = repository
-            .usage_source_state(Platform::ClaudeCode, &path.to_string_lossy())
+            .usage_source_state(Platform::ClaudeCode, &source_path)
             .unwrap()
             .unwrap();
 
@@ -915,11 +925,11 @@ mod tests {
         )
         .unwrap();
         drop(file);
-        let (_, file_size, modified_at) = source_metadata(&path).unwrap();
-        let source = claude::ClaudeSource::from_path(&path, &root);
+        let (_, file_size, modified_at) = source_metadata(&scanned_path).unwrap();
+        let source = claude::ClaudeSource::from_path(&scanned_path, &root);
         let (increment, outcome) = scan_claude_source(
-            &path,
-            &path.to_string_lossy(),
+            &scanned_path,
+            &source_path,
             file_size,
             modified_at,
             &source,
