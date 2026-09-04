@@ -5,7 +5,9 @@
 
 use std::collections::{BTreeMap, HashSet};
 use std::fs;
-use std::io::{Cursor, Read};
+#[cfg(test)]
+use std::io::Cursor;
+use std::io::{BufReader, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -20,13 +22,16 @@ use yaat_contracts::{
     UsageQueryRequest, UsageReport,
 };
 
-use crate::db::{Repository, UsageRecordInput, UsageScanSummary, UsageSourceInput};
+use crate::db::{
+    Repository, UsageRecordInput, UsageScanSummary, UsageSourceInput, UsageSourceState,
+};
 use crate::error::{AppError, AppResult};
 use crate::usage::UsageEventDraft;
 
 use super::{claude, codex};
 
-const MAX_USAGE_SOURCE_BYTES: u64 = 512 * 1024 * 1024;
+const CHECKPOINT_WINDOW_BYTES: u64 = 64 * 1024;
+const CLAUDE_CURSOR_STATE: &str = "claude:1";
 const MAX_QUERY_DAYS: i64 = 366;
 
 #[derive(Clone, Debug)]
@@ -271,12 +276,26 @@ fn scan_codex(
         check_cancelled(cancelled)?;
         let (source_path, file_size, modified_at) = source_metadata(&path)?;
         seen_paths.insert(source_path.clone());
-        if source_index.use_cache
-            && source_index
-                .repository
-                .usage_source_matches(Platform::Codex, &source_path, file_size, modified_at)
-                .map_err(AppError::database)?
-        {
+        let stored = source_index
+            .use_cache
+            .then(|| {
+                source_index
+                    .repository
+                    .usage_source_state(Platform::Codex, &source_path)
+                    .map_err(AppError::database)
+            })
+            .transpose()?
+            .flatten();
+        let compressed = path.to_string_lossy().ends_with(".jsonl.zst");
+        if stored.as_ref().is_some_and(|state| {
+            state.file_size == file_size
+                && state.modified_at == modified_at
+                && if compressed {
+                    state.fingerprint.starts_with("zstd:")
+                } else {
+                    state.cursor_offset.is_some() && state.parser_state.is_some()
+                }
+        }) {
             progress(OperationProgress {
                 phase: OperationPhase::Processing,
                 processed: index as u64 + 1,
@@ -284,46 +303,14 @@ fn scan_codex(
             });
             continue;
         }
-        let raw = read_usage_source_limited(&path);
-        let parsed = raw.as_ref().map_err(Clone::clone).and_then(|raw| {
-            if path.to_string_lossy().ends_with(".jsonl.zst") {
-                decode_zstd_bytes_limited(raw).map(|bytes| codex::parse_bytes(&bytes))
-            } else {
-                Ok(codex::parse_bytes(raw))
-            }
-        });
-        let fingerprint = raw
-            .as_ref()
-            .map(|bytes| fingerprint(bytes))
-            .unwrap_or_else(|_| format!("unreadable:{file_size}:{modified_at}"));
-        match parsed {
-            Ok(parsed) => {
-                merge_diagnostics(diagnostics, &parsed.diagnostics);
-                let malformed_records = parsed.diagnostics.malformed_records;
-                sources.push(UsageSourceInput {
-                    source_path: source_path.clone(),
-                    file_size,
-                    modified_at,
-                    fingerprint,
-                    malformed_records,
-                    records: parsed
-                        .events
-                        .into_iter()
-                        .map(|event| usage_record(event, &source_path))
-                        .collect(),
-                });
+        match scan_codex_source(&path, &source_path, file_size, modified_at, stored.as_ref()) {
+            Ok((source, parsed_diagnostics)) => {
+                merge_diagnostics(diagnostics, &parsed_diagnostics);
+                sources.push(source);
             }
             Err(_) => {
                 diagnostics.malformed_records = diagnostics.malformed_records.saturating_add(1);
                 diagnostics.is_partial = true;
-                sources.push(UsageSourceInput {
-                    source_path,
-                    file_size,
-                    modified_at,
-                    fingerprint,
-                    malformed_records: 1,
-                    records: Vec::new(),
-                });
             }
         }
         progress(OperationProgress {
@@ -333,6 +320,95 @@ fn scan_codex(
         });
     }
     Ok(())
+}
+
+fn scan_codex_source(
+    path: &Path,
+    source_path: &str,
+    file_size: u64,
+    modified_at: i64,
+    stored: Option<&UsageSourceState>,
+) -> Result<(UsageSourceInput, UsageDiagnostics), String> {
+    let rollout_id = codex_rollout_id(path)?;
+    if path.to_string_lossy().ends_with(".jsonl.zst") {
+        let file = fs::File::open(path).map_err(|error| error.to_string())?;
+        let decoder = zstd::stream::read::Decoder::new(file).map_err(|error| error.to_string())?;
+        let parsed = codex::parse_reader(&mut BufReader::new(decoder), &rollout_id, 0, None)
+            .map_err(|error| error.to_string())?;
+        let parsed_diagnostics = parsed.outcome.diagnostics.clone();
+        let malformed_records = parsed_diagnostics.malformed_records;
+        return Ok((
+            UsageSourceInput {
+                source_path: source_path.to_owned(),
+                file_size,
+                modified_at,
+                fingerprint: format!("zstd:{file_size}:{modified_at}"),
+                malformed_records,
+                cursor_offset: None,
+                parser_state: None,
+                append_only: false,
+                records: parsed
+                    .outcome
+                    .events
+                    .into_iter()
+                    .map(|event| usage_record(event, source_path))
+                    .collect(),
+            },
+            parsed_diagnostics,
+        ));
+    }
+
+    let incremental = stored.and_then(|state| {
+        let cursor = state.cursor_offset?;
+        let parser_state = state.parser_state.as_deref()?;
+        if cursor > file_size || checkpoint_fingerprint(path, cursor).ok()? != state.fingerprint {
+            return None;
+        }
+        let checkpoint: codex::CodexCheckpoint = serde_json::from_str(parser_state).ok()?;
+        if !checkpoint.is_current() {
+            return None;
+        }
+        Some((cursor, checkpoint, state.malformed_records))
+    });
+    let (start_offset, checkpoint, previous_malformed, append_only) = incremental
+        .map_or((0, None, 0, false), |(cursor, checkpoint, malformed)| {
+            (cursor, Some(checkpoint), malformed, true)
+        });
+    let mut file = fs::File::open(path).map_err(|error| error.to_string())?;
+    file.seek(SeekFrom::Start(start_offset))
+        .map_err(|error| error.to_string())?;
+    let parsed = codex::parse_reader(
+        &mut BufReader::new(file),
+        &rollout_id,
+        start_offset,
+        checkpoint,
+    )
+    .map_err(|error| error.to_string())?;
+    let cursor_offset = start_offset.saturating_add(parsed.consumed_bytes);
+    let fingerprint = checkpoint_fingerprint(path, cursor_offset)?;
+    let parser_state =
+        serde_json::to_string(&parsed.checkpoint).map_err(|error| error.to_string())?;
+    let parsed_diagnostics = parsed.outcome.diagnostics.clone();
+    let malformed_records = previous_malformed.saturating_add(parsed_diagnostics.malformed_records);
+    Ok((
+        UsageSourceInput {
+            source_path: source_path.to_owned(),
+            file_size,
+            modified_at,
+            fingerprint,
+            malformed_records,
+            cursor_offset: Some(cursor_offset),
+            parser_state: Some(parser_state),
+            append_only,
+            records: parsed
+                .outcome
+                .events
+                .into_iter()
+                .map(|event| usage_record(event, source_path))
+                .collect(),
+        },
+        parsed_diagnostics,
+    ))
 }
 
 fn scan_claude(
@@ -365,12 +441,22 @@ fn scan_claude(
         check_cancelled(cancelled)?;
         let (source_path, file_size, modified_at) = source_metadata(&path)?;
         seen_paths.insert(source_path.clone());
-        if source_index.use_cache
-            && source_index
-                .repository
-                .usage_source_matches(Platform::ClaudeCode, &source_path, file_size, modified_at)
-                .map_err(AppError::database)?
-        {
+        let stored = source_index
+            .use_cache
+            .then(|| {
+                source_index
+                    .repository
+                    .usage_source_state(Platform::ClaudeCode, &source_path)
+                    .map_err(AppError::database)
+            })
+            .transpose()?
+            .flatten();
+        if stored.as_ref().is_some_and(|state| {
+            state.file_size == file_size
+                && state.modified_at == modified_at
+                && state.cursor_offset.is_some()
+                && state.parser_state.as_deref() == Some(CLAUDE_CURSOR_STATE)
+        }) {
             progress(OperationProgress {
                 phase: OperationPhase::Processing,
                 processed: index as u64 + 1,
@@ -378,19 +464,19 @@ fn scan_claude(
             });
             continue;
         }
-        let bytes = match read_usage_source_limited(&path) {
-            Ok(bytes) => bytes,
+        let source = claude::ClaudeSource::from_path(&path, &root);
+        let (source_input, outcome) = match scan_claude_source(
+            &path,
+            &source_path,
+            file_size,
+            modified_at,
+            &source,
+            stored.as_ref(),
+        ) {
+            Ok(result) => result,
             Err(_) => {
                 diagnostics.malformed_records = diagnostics.malformed_records.saturating_add(1);
                 diagnostics.is_partial = true;
-                changed_sources.push(UsageSourceInput {
-                    source_path,
-                    file_size,
-                    modified_at,
-                    fingerprint: format!("unreadable:{file_size}:{modified_at}"),
-                    malformed_records: 1,
-                    records: Vec::new(),
-                });
                 progress(OperationProgress {
                     phase: OperationPhase::Processing,
                     processed: index as u64 + 1,
@@ -399,20 +485,11 @@ fn scan_claude(
                 continue;
             }
         };
-        let source = claude::ClaudeSource::from_path(&path, &root);
-        let outcome = claude::parse_jsonl(&bytes, &source);
         merge_diagnostics(diagnostics, &outcome.diagnostics);
         for event in &outcome.events {
             event_sources.insert(event.source_event_key.clone(), source_path.clone());
         }
-        changed_sources.push(UsageSourceInput {
-            source_path,
-            file_size,
-            modified_at,
-            fingerprint: fingerprint(&bytes),
-            malformed_records: outcome.diagnostics.malformed_records,
-            records: Vec::new(),
-        });
+        changed_sources.push(source_input);
         events.extend(outcome.events);
         progress(OperationProgress {
             phase: OperationPhase::Processing,
@@ -445,6 +522,53 @@ fn scan_claude(
         }
     }
     Ok(())
+}
+
+fn scan_claude_source(
+    path: &Path,
+    source_path: &str,
+    file_size: u64,
+    modified_at: i64,
+    source: &claude::ClaudeSource,
+    stored: Option<&UsageSourceState>,
+) -> Result<(UsageSourceInput, super::ParseOutcome), String> {
+    let incremental = stored.and_then(|state| {
+        let cursor = state.cursor_offset?;
+        if state.parser_state.as_deref() != Some(CLAUDE_CURSOR_STATE)
+            || cursor > file_size
+            || checkpoint_fingerprint(path, cursor).ok()? != state.fingerprint
+        {
+            return None;
+        }
+        Some((cursor, state.malformed_records))
+    });
+    let (start_offset, previous_malformed, append_only) = incremental
+        .map_or((0, 0, false), |(cursor, malformed)| {
+            (cursor, malformed, true)
+        });
+    let mut file = fs::File::open(path).map_err(|error| error.to_string())?;
+    file.seek(SeekFrom::Start(start_offset))
+        .map_err(|error| error.to_string())?;
+    let parsed = claude::parse_reader(&mut BufReader::new(file), source)
+        .map_err(|error| error.to_string())?;
+    let cursor_offset = start_offset.saturating_add(parsed.consumed_bytes);
+    let fingerprint = checkpoint_fingerprint(path, cursor_offset)?;
+    let malformed_records =
+        previous_malformed.saturating_add(parsed.outcome.diagnostics.malformed_records);
+    Ok((
+        UsageSourceInput {
+            source_path: source_path.to_owned(),
+            file_size,
+            modified_at,
+            fingerprint,
+            malformed_records,
+            cursor_offset: Some(cursor_offset),
+            parser_state: Some(CLAUDE_CURSOR_STATE.into()),
+            append_only,
+            records: Vec::new(),
+        },
+        parsed.outcome,
+    ))
 }
 
 fn jsonl_files_cancellable(
@@ -488,32 +612,28 @@ fn check_cancelled(cancelled: &AtomicBool) -> AppResult<()> {
     }
 }
 
-fn read_usage_source_limited(path: &Path) -> Result<Vec<u8>, String> {
-    let metadata = fs::metadata(path).map_err(|error| error.to_string())?;
-    if !metadata.is_file() || metadata.len() > MAX_USAGE_SOURCE_BYTES {
-        return Err("usage source exceeds the supported size or is not a file".into());
-    }
-    fs::read(path).map_err(|error| error.to_string())
+fn codex_rollout_id(path: &Path) -> Result<String, String> {
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| "Codex rollout file name is not UTF-8".to_string())?;
+    Ok(name.strip_suffix(".zst").unwrap_or(name).to_owned())
 }
 
-#[cfg(test)]
-fn read_zstd_limited(path: &Path) -> Result<Vec<u8>, String> {
-    let compressed = read_usage_source_limited(path)?;
-    decode_zstd_bytes_limited(&compressed)
-}
-
-fn decode_zstd_bytes_limited(compressed: &[u8]) -> Result<Vec<u8>, String> {
-    let decoder = zstd::stream::read::Decoder::new(Cursor::new(compressed))
-        .map_err(|error| error.to_string())?;
-    let mut decoded = Vec::new();
-    decoder
-        .take(MAX_USAGE_SOURCE_BYTES + 1)
-        .read_to_end(&mut decoded)
-        .map_err(|error| error.to_string())?;
-    if decoded.len() as u64 > MAX_USAGE_SOURCE_BYTES {
-        return Err("compressed usage source exceeds the supported size".into());
+fn checkpoint_fingerprint(path: &Path, cursor: u64) -> Result<String, String> {
+    let mut file = fs::File::open(path).map_err(|error| error.to_string())?;
+    let file_size = file.metadata().map_err(|error| error.to_string())?.len();
+    if cursor > file_size {
+        return Err("usage cursor is beyond the end of the source file".into());
     }
-    Ok(decoded)
+    let start = cursor.saturating_sub(CHECKPOINT_WINDOW_BYTES);
+    file.seek(SeekFrom::Start(start))
+        .map_err(|error| error.to_string())?;
+    let mut bytes = Vec::with_capacity((cursor - start) as usize);
+    file.take(cursor - start)
+        .read_to_end(&mut bytes)
+        .map_err(|error| error.to_string())?;
+    Ok(hex::encode(Sha256::digest(bytes)))
 }
 
 fn unique_roots(roots: &[UsageRoot]) -> Vec<UsageRoot> {
@@ -557,10 +677,6 @@ fn source_metadata(path: &Path) -> AppResult<(String, u64, i64)> {
         i64::try_from(modified_at)
             .map_err(|_| AppError::Validation("usage source timestamp is out of range".into()))?,
     ))
-}
-
-fn fingerprint(bytes: &[u8]) -> String {
-    hex::encode(Sha256::digest(bytes))
 }
 
 fn merge_diagnostics(target: &mut UsageDiagnostics, source: &UsageDiagnostics) {
@@ -624,6 +740,8 @@ fn add_tokens(target: &mut TokenBreakdown, source: &TokenBreakdown) {
 
 #[cfg(test)]
 mod tests {
+    use std::io::Write;
+
     use super::*;
 
     #[test]
@@ -643,7 +761,7 @@ mod tests {
     }
 
     #[test]
-    fn codex_usage_sources_include_bounded_zstd_archives() {
+    fn codex_usage_sources_include_zstd_archives() {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("rollout.jsonl.zst");
         let content = b"{\"type\":\"event_msg\"}\n";
@@ -655,18 +773,172 @@ mod tests {
 
         let included = jsonl_files(temp.path(), true);
         assert_eq!(included, vec![path.clone()]);
-        assert_eq!(read_zstd_limited(&path).unwrap(), content);
         let excluded = jsonl_files(temp.path(), false);
         assert!(excluded.is_empty());
     }
 
     #[test]
-    fn usage_source_reader_rejects_oversized_files() {
+    fn checkpoint_fingerprint_supports_large_sparse_files() {
         let temp = tempfile::tempdir().unwrap();
-        let file = temp.path().join("oversized.jsonl");
+        let file = temp.path().join("large.jsonl");
         let handle = fs::File::create(&file).unwrap();
-        handle.set_len(MAX_USAGE_SOURCE_BYTES + 1).unwrap();
-        assert!(read_usage_source_limited(&file).is_err());
+        let size = 512 * 1024 * 1024 + 1;
+        handle.set_len(size).unwrap();
+        assert!(!checkpoint_fingerprint(&file, size).unwrap().is_empty());
+    }
+
+    #[test]
+    fn codex_scan_appends_from_a_persisted_cursor() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("codex");
+        let path = root.join("sessions/2026/09/04/rollout-thread_rollout-a.jsonl");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(
+            &path,
+            concat!(
+                r#"{"type":"session_meta","payload":{"id":"thread-a"}}"#,
+                "\n",
+                r#"{"type":"turn_context","payload":{"turn_id":"turn-a","model":"gpt-test"}}"#,
+                "\n",
+                r#"{"type":"event_msg","timestamp":"2026-09-04T00:00:00Z","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":10,"output_tokens":2,"total_tokens":12}}}}"#,
+                "\n"
+            ),
+        )
+        .unwrap();
+        let repository = Repository::in_memory().unwrap();
+        scan(
+            &repository,
+            Platform::Codex,
+            &[UsageRoot { path: root.clone() }],
+        )
+        .unwrap();
+        let first_state = repository
+            .usage_source_state(Platform::Codex, &path.to_string_lossy())
+            .unwrap()
+            .unwrap();
+
+        let mut file = fs::OpenOptions::new().append(true).open(&path).unwrap();
+        file.write_all(
+            concat!(
+                r#"{"type":"event_msg","timestamp":"2026-09-04T00:01:00Z","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":20,"output_tokens":4,"total_tokens":24},"last_token_usage":{"input_tokens":10,"output_tokens":2,"total_tokens":12}}}}"#,
+                "\n"
+            )
+            .as_bytes(),
+        )
+        .unwrap();
+        drop(file);
+        let (_, file_size, modified_at) = source_metadata(&path).unwrap();
+        let (increment, _) = scan_codex_source(
+            &path,
+            &path.to_string_lossy(),
+            file_size,
+            modified_at,
+            Some(&first_state),
+        )
+        .unwrap();
+        assert!(increment.append_only);
+        assert_eq!(increment.records.len(), 1);
+
+        scan(&repository, Platform::Codex, &[UsageRoot { path: root }]).unwrap();
+        let rows = repository
+            .usage_rows(Platform::Codex, 0, i64::MAX, None)
+            .unwrap();
+        let state = repository
+            .usage_source_state(Platform::Codex, &path.to_string_lossy())
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows.iter().map(|row| row.tokens.total()).sum::<u64>(), 24);
+        assert_eq!(state.cursor_offset, Some(state.file_size));
+    }
+
+    #[test]
+    fn codex_branch_rollouts_do_not_share_event_ids() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("codex");
+        let directory = root.join("sessions/2026/09/04");
+        fs::create_dir_all(&directory).unwrap();
+        let transcript = concat!(
+            r#"{"type":"session_meta","payload":{"id":"thread-a"}}"#,
+            "\n",
+            r#"{"type":"turn_context","payload":{"turn_id":"turn-a","model":"gpt-test"}}"#,
+            "\n",
+            r#"{"type":"event_msg","timestamp":"2026-09-04T00:00:00Z","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":10,"output_tokens":2,"total_tokens":12}}}}"#,
+            "\n"
+        );
+        fs::write(directory.join("rollout-thread_rollout-a.jsonl"), transcript).unwrap();
+        fs::write(directory.join("rollout-thread_rollout-b.jsonl"), transcript).unwrap();
+        let repository = Repository::in_memory().unwrap();
+
+        scan(&repository, Platform::Codex, &[UsageRoot { path: root }]).unwrap();
+        let rows = repository
+            .usage_rows(Platform::Codex, 0, i64::MAX, None)
+            .unwrap();
+
+        assert_eq!(rows.len(), 2);
+    }
+
+    #[test]
+    fn claude_scan_appends_from_a_persisted_cursor() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("claude");
+        let path = root.join("projects/-workspace/session-a.jsonl");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(
+            &path,
+            concat!(
+                r#"{"type":"assistant","sessionId":"session-a","timestamp":"2026-09-04T00:00:00Z","requestId":"req-1","message":{"id":"msg-1","stop_reason":"end_turn","usage":{"input_tokens":3,"output_tokens":5}}}"#,
+                "\n"
+            ),
+        )
+        .unwrap();
+        let repository = Repository::in_memory().unwrap();
+        scan(
+            &repository,
+            Platform::ClaudeCode,
+            &[UsageRoot { path: root.clone() }],
+        )
+        .unwrap();
+        let first_state = repository
+            .usage_source_state(Platform::ClaudeCode, &path.to_string_lossy())
+            .unwrap()
+            .unwrap();
+
+        let mut file = fs::OpenOptions::new().append(true).open(&path).unwrap();
+        file.write_all(
+            concat!(
+                r#"{"type":"assistant","sessionId":"session-a","timestamp":"2026-09-04T00:01:00Z","requestId":"req-2","message":{"id":"msg-2","stop_reason":"end_turn","usage":{"input_tokens":7,"output_tokens":11}}}"#,
+                "\n"
+            )
+            .as_bytes(),
+        )
+        .unwrap();
+        drop(file);
+        let (_, file_size, modified_at) = source_metadata(&path).unwrap();
+        let source = claude::ClaudeSource::from_path(&path, &root);
+        let (increment, outcome) = scan_claude_source(
+            &path,
+            &path.to_string_lossy(),
+            file_size,
+            modified_at,
+            &source,
+            Some(&first_state),
+        )
+        .unwrap();
+        assert!(increment.append_only);
+        assert_eq!(outcome.events.len(), 1);
+
+        scan(
+            &repository,
+            Platform::ClaudeCode,
+            &[UsageRoot { path: root }],
+        )
+        .unwrap();
+        let rows = repository
+            .usage_rows(Platform::ClaudeCode, 0, i64::MAX, None)
+            .unwrap();
+        assert_eq!(rows.len(), 2);
     }
 
     #[test]

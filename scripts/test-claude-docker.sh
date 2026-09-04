@@ -1,7 +1,7 @@
 #!/bin/sh
 set -eu
 
-image="yaat-claude-integration:2.1.226"
+image="yaat-claude-integration:2.1.260"
 
 docker build \
   --file docker/claude-integration.Dockerfile \

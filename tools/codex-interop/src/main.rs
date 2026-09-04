@@ -41,6 +41,10 @@ mod process {
 
     const MAX_OUTPUT_BYTES: u64 = 64 * 1024;
 
+    pub fn configure_background(command: &mut Command) {
+        let _ = command;
+    }
+
     pub fn run_with_timeout(
         program: &Path,
         args: &[&str],

@@ -59,7 +59,7 @@ YAAT 只读取 Codex / Claude Code 会话文件中的时间、请求标识与 To
 
 - Codex：索引 `sessions` 与 `archived_sessions`，处理累计计数、重置、归档移动和不完整文件尾部。
 - Claude Code：索引 `projects` 下的 JSONL，会处理主会话、子代理、重放、初步 / 最终批次和缓存 Token。
-- 源文件按路径、大小、mtime 和内容指纹增量索引；同一逻辑事件即使出现在多个复制历史中也只统计一次。Codex 同时支持普通 `.jsonl` 和 `.jsonl.zst`；单个源文件超过 512 MiB 时跳过并标记为部分统计。
+- 普通 JSONL 按持久字节游标和尾部指纹只解析新增的完整记录；文件被截断或改写时回退全量重建。同一逻辑事件即使出现在多个复制历史中也只统计一次。Codex 同时支持普通 `.jsonl` 和全量流式解析的 `.jsonl.zst`，不再因整个源文件超过 512 MiB 而跳过。
 - 日期查询最长 366 天，按用户选择的 IANA 时区聚合；支持按模型过滤、自动刷新、缓存命中 Token 与缓存命中率。
 
 ## 会话历史统一
@@ -130,9 +130,9 @@ TAURI_SIGNING_PRIVATE_KEY_PATH=/path/to/yaat-updater.key pnpm run tauri build
 
 GitHub Actions 会在每次推送和 Pull Request 上执行前端门禁及 Linux、macOS、Windows Rust 门禁。仓库的 `Release` 工作流由维护者手动启动，按 `package.json` / Cargo workspace / `tauri.conf.json` 中的应用版本创建草稿 Release，构建 macOS Apple Silicon、macOS Intel 与 Windows x64 安装包，并生成 Tauri updater 所需的签名和 `latest.json`。草稿发布后才会被已安装的 YAAT 检测到。
 
-Codex 互操作镜像固定安装官方 `@openai/codex 0.147.0`。测试源码不挂载宿主机账号目录；容器运行阶段使用 `--network none`、移除全部 capabilities，并验证多行 `custom` Provider、Responses、直接凭据与官方账号私有凭据复制切换，同时确认用户自有 Provider、MCP 配置、注释和非账号凭据字段未丢失。
+Codex 互操作镜像固定安装官方 `@openai/codex 0.153.2`。测试源码不挂载宿主机账号目录；容器运行阶段使用 `--network none`、移除全部 capabilities，并验证多行 `custom` Provider、Responses、直接凭据与官方账号私有凭据复制切换，同时确认用户自有 Provider、MCP 配置、注释和非账号凭据字段未丢失。
 
-Claude 互操作镜像固定安装官方 `@anthropic-ai/claude-code 2.1.226`，直接复用生产 Claude 适配器生成全局与隔离 `settings.json`，验证直接凭据、自定义请求头、注释、permissions、MCP 和未知字段保留，并让真实 CLI 在断网容器中加载同一隔离环境。这些固定版本是可重复的互操作测试基准，不是运行时版本门禁。
+Claude 互操作镜像固定安装官方 `@anthropic-ai/claude-code 2.1.260`，直接复用生产 Claude 适配器生成全局与隔离 `settings.json`，验证直接凭据、自定义请求头、注释、permissions、MCP 和未知字段保留，并让真实 CLI 在断网容器中加载同一隔离环境。这些固定版本是可重复的互操作测试基准，不是运行时版本门禁。
 
 ## 目录
 

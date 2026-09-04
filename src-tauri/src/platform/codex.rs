@@ -1796,7 +1796,7 @@ wire_api = "responses"
             return;
         };
         let version = Command::new(&codex).arg("--version").output().unwrap();
-        if !String::from_utf8_lossy(&version.stdout).contains("0.147.0") {
+        if !String::from_utf8_lossy(&version.stdout).contains("0.153.2") {
             return;
         }
         let temp = TempDir::new().unwrap();

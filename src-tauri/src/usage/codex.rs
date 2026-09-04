@@ -1,71 +1,121 @@
 //! Metadata-only parser for Codex session usage snapshots.
 
+#[cfg(test)]
+use std::io::Cursor;
+use std::io::{self, BufRead};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use chrono::DateTime;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use yaat_contracts::{Platform, TokenBreakdown, UsageDiagnostics};
 
 use super::{ParseOutcome, UsageEventDraft, UsageQuality};
 
+const CHECKPOINT_VERSION: u32 = 1;
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct CodexCheckpoint {
+    version: u32,
+    state: ParserState,
+}
+
+impl CodexCheckpoint {
+    pub fn is_current(&self) -> bool {
+        self.version == CHECKPOINT_VERSION
+    }
+}
+
+pub struct StreamParseOutcome {
+    pub outcome: ParseOutcome,
+    pub checkpoint: CodexCheckpoint,
+    pub consumed_bytes: u64,
+}
+
 /// Parse one complete Codex transcript snapshot. An incomplete final record is
 /// ignored and retried on the next full scan.
+#[cfg(test)]
 pub fn parse_bytes(bytes: &[u8]) -> ParseOutcome {
-    let mut state = ParserState::default();
+    parse_reader(&mut Cursor::new(bytes), "", 0, None)
+        .expect("in-memory Codex transcript reads cannot fail")
+        .outcome
+}
+
+pub fn parse_reader<R: BufRead>(
+    reader: &mut R,
+    rollout_id: &str,
+    start_offset: u64,
+    checkpoint: Option<CodexCheckpoint>,
+) -> io::Result<StreamParseOutcome> {
+    let mut state = checkpoint
+        .filter(|checkpoint| checkpoint.version == CHECKPOINT_VERSION)
+        .map_or_else(ParserState::default, |checkpoint| checkpoint.state);
     let mut diagnostics = UsageDiagnostics {
         files_scanned: 1,
         last_scanned_at: Some(now_ms()),
         ..UsageDiagnostics::default()
     };
     let mut events = Vec::new();
-    let mut offset = 0_usize;
+    let mut consumed_bytes = 0_u64;
+    let mut line = Vec::new();
 
-    while offset < bytes.len() {
-        let record_start = offset as u64;
-        let rest = &bytes[offset..];
-        let newline = rest.iter().position(|byte| *byte == b'\n');
-        let (record, consumed, terminated) = match newline {
-            Some(index) => (&rest[..index], index + 1, true),
-            None => (rest, rest.len(), false),
-        };
-        let record = record.strip_suffix(b"\r").unwrap_or(record);
+    loop {
+        line.clear();
+        let consumed = reader.read_until(b'\n', &mut line)?;
+        if consumed == 0 {
+            break;
+        }
+        if line.last() != Some(&b'\n') {
+            if line.iter().any(|byte| !byte.is_ascii_whitespace()) {
+                diagnostics.is_partial = true;
+            }
+            break;
+        }
+        let record_start = start_offset.saturating_add(consumed_bytes);
+        consumed_bytes = consumed_bytes.saturating_add(consumed as u64);
+        line.pop();
+        let record = line.strip_suffix(b"\r").unwrap_or(&line);
 
         if record.iter().all(u8::is_ascii_whitespace) {
-            offset += consumed;
             continue;
         }
 
-        match parse_record(record, record_start, &mut state, &mut diagnostics) {
+        match parse_record(
+            record,
+            record_start,
+            rollout_id,
+            &mut state,
+            &mut diagnostics,
+        ) {
             Ok(event) => {
                 if let Some(event) = event {
                     update_coverage(&mut diagnostics, event.occurred_at_ms);
                     events.push(event);
                 }
             }
-            Err(()) if !terminated => {
-                // An actively written JSONL file may end in the middle of a
-                // record. A later full scan retries the completed bytes.
-                diagnostics.is_partial = true;
-                break;
-            }
             Err(()) => {
                 diagnostics.malformed_records = diagnostics.malformed_records.saturating_add(1);
                 diagnostics.is_partial = true;
             }
         }
-
-        offset += consumed;
     }
 
-    ParseOutcome {
-        events,
-        diagnostics,
-    }
+    Ok(StreamParseOutcome {
+        outcome: ParseOutcome {
+            events,
+            diagnostics,
+        },
+        checkpoint: CodexCheckpoint {
+            version: CHECKPOINT_VERSION,
+            state,
+        },
+        consumed_bytes,
+    })
 }
 
 fn parse_record(
     record: &[u8],
     record_offset: u64,
+    rollout_id: &str,
     state: &mut ParserState,
     diagnostics: &mut UsageDiagnostics,
 ) -> Result<Option<UsageEventDraft>, ()> {
@@ -87,7 +137,7 @@ fn parse_record(
                 return Ok(None);
             }
             let record: TokenCountRecord = serde_json::from_slice(record).map_err(|_| ())?;
-            state.apply_token_count(record, record_offset, diagnostics)
+            state.apply_token_count(record, record_offset, rollout_id, diagnostics)
         }
         _ => Ok(None),
     }
@@ -151,7 +201,7 @@ struct TokenCountInfo {
     last_token_usage: Option<RawTokenUsage>,
 }
 
-#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(default)]
 struct RawTokenUsage {
     input_tokens: u64,
@@ -265,7 +315,8 @@ impl JsonTimestamp {
     }
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[serde(default)]
 struct ParserState {
     session_id: Option<String>,
     parent_session_id: Option<String>,
@@ -313,6 +364,7 @@ impl ParserState {
         &mut self,
         record: TokenCountRecord,
         record_offset: u64,
+        rollout_id: &str,
         diagnostics: &mut UsageDiagnostics,
     ) -> Result<Option<UsageEventDraft>, ()> {
         let occurred_at_ms = record.timestamp.into_millis().ok_or(())?;
@@ -365,7 +417,14 @@ impl ParserState {
 
         Ok(Some(UsageEventDraft {
             platform: Platform::Codex,
-            source_event_key: format!("codex:{session_id}:{record_offset}"),
+            source_event_key: format!(
+                "codex:{}:{record_offset}",
+                if rollout_id.is_empty() {
+                    session_id.as_str()
+                } else {
+                    rollout_id
+                }
+            ),
             session_id,
             parent_session_id: self.parent_session_id.clone(),
             turn_id: self.turn_id.clone(),
@@ -579,10 +638,11 @@ mod tests {
         let mut partial = prefix.clone();
         partial.extend_from_slice(&record.as_bytes()[..record.len() / 2]);
 
-        let first = parse_bytes(&partial);
-        assert!(first.events.is_empty());
-        assert_eq!(first.diagnostics.malformed_records, 0);
-        assert!(first.diagnostics.is_partial);
+        let first = parse_reader(&mut Cursor::new(&partial), "rollout-a", 0, None).unwrap();
+        assert_eq!(first.consumed_bytes, prefix.len() as u64);
+        assert!(first.outcome.events.is_empty());
+        assert_eq!(first.outcome.diagnostics.malformed_records, 0);
+        assert!(first.outcome.diagnostics.is_partial);
 
         let mut complete = prefix;
         complete.extend_from_slice(record.as_bytes());
@@ -600,13 +660,66 @@ mod tests {
             usage("2026-08-01T00:00:02Z", [10, 0, 0, 2, 1, 12], None),
         ]);
 
-        let active = parse_bytes(&bytes);
-        let archived = parse_bytes(&bytes);
+        let active = parse_reader(&mut Cursor::new(&bytes), "rollout-a.jsonl", 0, None)
+            .unwrap()
+            .outcome;
+        let archived = parse_reader(&mut Cursor::new(&bytes), "rollout-a.jsonl", 0, None)
+            .unwrap()
+            .outcome;
         assert_eq!(
             active.events[0].source_event_key,
             archived.events[0].source_event_key
         );
         assert!(!active.events[0].source_event_key.contains("sessions"));
+    }
+
+    #[test]
+    fn physical_rollout_id_scopes_events_for_one_logical_thread() {
+        let bytes = jsonl(&[
+            meta("thread-a", None),
+            turn("turn-a", "gpt-test"),
+            usage("2026-08-01T00:00:02Z", [10, 0, 0, 2, 1, 12], None),
+        ]);
+        let first = parse_reader(&mut Cursor::new(&bytes), "rollout-a", 0, None).unwrap();
+        let second = parse_reader(&mut Cursor::new(&bytes), "rollout-b", 0, None).unwrap();
+
+        assert_eq!(first.outcome.events[0].session_id, "thread-a");
+        assert_eq!(second.outcome.events[0].session_id, "thread-a");
+        assert_ne!(
+            first.outcome.events[0].source_event_key,
+            second.outcome.events[0].source_event_key
+        );
+    }
+
+    #[test]
+    fn checkpoint_continues_cumulative_usage_from_the_committed_byte() {
+        let first_chunk = jsonl(&[
+            meta("thread-a", None),
+            turn("turn-a", "gpt-test"),
+            usage("2026-08-01T00:00:02Z", [10, 0, 0, 2, 1, 12], None),
+        ]);
+        let second_chunk = jsonl(&[usage(
+            "2026-08-01T00:00:03Z",
+            [25, 5, 0, 5, 2, 30],
+            Some([15, 5, 0, 3, 1, 18]),
+        )]);
+        let first = parse_reader(&mut Cursor::new(&first_chunk), "rollout-a", 0, None).unwrap();
+        let second = parse_reader(
+            &mut Cursor::new(&second_chunk),
+            "rollout-a",
+            first.consumed_bytes,
+            Some(first.checkpoint),
+        )
+        .unwrap();
+
+        assert_eq!(first.outcome.events.len(), 1);
+        assert_eq!(second.outcome.events.len(), 1);
+        assert_eq!(second.outcome.events[0].tokens.total(), 18);
+        assert!(
+            second.outcome.events[0]
+                .source_event_key
+                .ends_with(&first.consumed_bytes.to_string())
+        );
     }
 
     #[test]

@@ -1,4 +1,4 @@
-//! Full-snapshot, metadata-only parser for Claude Code transcript usage.
+//! Streaming, metadata-only parser for Claude Code transcript usage.
 //!
 //! Claude Code writes the same API response more than once while a streamed
 //! assistant message is being assembled. It can also replay parent messages in
@@ -6,9 +6,12 @@
 //! the envelope, identifiers, timestamp, model, stop marker, and usage object;
 //! message content is an ignored field and is never retained by YAAT.
 
+#[cfg(test)]
+use std::io::Cursor;
 use std::{
     cmp::Ordering,
     collections::{BTreeMap, HashMap},
+    io::{self, BufRead},
     path::{Component, Path},
 };
 
@@ -116,32 +119,49 @@ pub struct ReconciledEvents {
     pub duplicate_records: u64,
 }
 
+pub struct StreamParseOutcome {
+    pub outcome: ParseOutcome,
+    pub consumed_bytes: u64,
+}
+
 /// Parse all complete JSONL records from one transcript snapshot. A non-empty
 /// trailing fragment is deferred rather than classified as malformed; the next
 /// full scan will retry it after the writer finishes the record.
+#[cfg(test)]
 pub fn parse_jsonl(bytes: &[u8], source: &ClaudeSource) -> ParseOutcome {
+    parse_reader(&mut Cursor::new(bytes), source)
+        .expect("in-memory Claude transcript reads cannot fail")
+        .outcome
+}
+
+pub fn parse_reader<R: BufRead>(
+    reader: &mut R,
+    source: &ClaudeSource,
+) -> io::Result<StreamParseOutcome> {
     let mut outcome = ParseOutcome::default();
     outcome.diagnostics.files_scanned = 1;
     outcome.diagnostics.last_scanned_at = Some(Utc::now().timestamp_millis());
 
     let mut candidates: HashMap<ExactDedupeKey, ParsedCandidate> = HashMap::new();
-    let mut line_start = 0usize;
+    let mut line = Vec::new();
+    let mut consumed_bytes = 0_u64;
 
-    for (newline_index, _) in bytes.iter().enumerate().filter(|(_, byte)| **byte == b'\n') {
-        let mut line = &bytes[line_start..newline_index];
-        if line.last() == Some(&b'\r') {
-            line = &line[..line.len() - 1];
+    loop {
+        line.clear();
+        let consumed = reader.read_until(b'\n', &mut line)?;
+        if consumed == 0 {
+            break;
         }
-        parse_line(line, source, &mut candidates, &mut outcome.diagnostics);
-
-        line_start = newline_index.saturating_add(1);
-    }
-
-    if bytes[line_start..]
-        .iter()
-        .any(|byte| !byte.is_ascii_whitespace())
-    {
-        outcome.diagnostics.is_partial = true;
+        if line.last() != Some(&b'\n') {
+            if line.iter().any(|byte| !byte.is_ascii_whitespace()) {
+                outcome.diagnostics.is_partial = true;
+            }
+            break;
+        }
+        consumed_bytes = consumed_bytes.saturating_add(consumed as u64);
+        line.pop();
+        let record = line.strip_suffix(b"\r").unwrap_or(&line);
+        parse_line(record, source, &mut candidates, &mut outcome.diagnostics);
     }
 
     let mut selected = candidates.into_values().collect::<Vec<_>>();
@@ -152,10 +172,13 @@ pub fn parse_jsonl(bytes: &[u8], source: &ClaudeSource) -> ParseOutcome {
         .map(|candidate| candidate.event)
         .collect();
     update_coverage(&mut outcome.diagnostics, &outcome.events);
-    outcome
+    Ok(StreamParseOutcome {
+        outcome,
+        consumed_bytes,
+    })
 }
 
-/// Reconcile a full scan's events across main, subagent, and progress-log files.
+/// Reconcile one scan batch's events across main, subagent, and progress-log files.
 ///
 /// Exact duplicates use `(source namespace, message.id, requestId)`. If a
 /// sidechain copied a parent message under a *different* request ID, the

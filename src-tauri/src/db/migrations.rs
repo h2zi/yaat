@@ -4,7 +4,7 @@ use rusqlite::{Connection, TransactionBehavior, params};
 
 use super::{DbError, now_millis};
 
-pub(super) const LATEST_SCHEMA_VERSION: i64 = 1;
+pub(super) const LATEST_SCHEMA_VERSION: i64 = 2;
 
 struct Migration {
     version: i64,
@@ -12,12 +12,15 @@ struct Migration {
     sql: &'static str,
 }
 
-const MIGRATIONS: &[Migration] = &[Migration {
-    version: 1,
-    name: "initial_store",
-    sql: r#"
+const MIGRATIONS: &[Migration] = &[
+    Migration {
+        version: 1,
+        name: "initial_store",
+        sql: r#"
         CREATE TABLE providers (
             id              TEXT PRIMARY KEY NOT NULL,
+            created_at      INTEGER NOT NULL,
+            updated_at      INTEGER NOT NULL,
             platform        TEXT NOT NULL CHECK (platform IN ('codex', 'claude_code', 'claude_desktop')),
             kind            TEXT NOT NULL CHECK (kind IN ('official_subscription', 'official_api', 'third_party')),
             name            TEXT NOT NULL CHECK (length(trim(name)) > 0),
@@ -29,9 +32,7 @@ const MIGRATIONS: &[Migration] = &[Migration {
             platform_config TEXT NOT NULL,
             secret_kind     TEXT NOT NULL CHECK (secret_kind IN ('none', 'api_key', 'bearer_token')),
             profile_home    TEXT,
-            status          TEXT NOT NULL CHECK (status IN ('ready', 'needs_login')),
-            created_at      INTEGER NOT NULL,
-            updated_at      INTEGER NOT NULL
+            status          TEXT NOT NULL CHECK (status IN ('ready', 'needs_login'))
         );
 
         CREATE INDEX providers_platform_idx
@@ -39,9 +40,9 @@ const MIGRATIONS: &[Migration] = &[Migration {
 
         CREATE TABLE platform_bindings (
             platform        TEXT PRIMARY KEY NOT NULL CHECK (platform IN ('codex', 'claude_code', 'claude_desktop')),
+            updated_at      INTEGER NOT NULL,
             global_profile_id TEXT,
             last_managed_profile_id TEXT,
-            updated_at      INTEGER NOT NULL,
             FOREIGN KEY(global_profile_id) REFERENCES providers(id) ON DELETE RESTRICT,
             FOREIGN KEY(last_managed_profile_id) REFERENCES providers(id) ON DELETE SET NULL
         );
@@ -54,6 +55,7 @@ const MIGRATIONS: &[Migration] = &[Migration {
 
         CREATE TABLE settings (
             singleton_id            INTEGER PRIMARY KEY NOT NULL CHECK (singleton_id = 1),
+            updated_at              INTEGER NOT NULL,
             language                TEXT NOT NULL,
             theme                   TEXT NOT NULL,
             timezone                TEXT NOT NULL,
@@ -68,18 +70,17 @@ const MIGRATIONS: &[Migration] = &[Migration {
             unify_claude_desktop_code_history INTEGER NOT NULL DEFAULT 0 CHECK (unify_claude_desktop_code_history IN (0, 1)),
             claude_desktop_history_target TEXT,
             usage_refresh_interval_seconds INTEGER NOT NULL DEFAULT 0
-                CHECK (usage_refresh_interval_seconds IN (0, 5, 10, 30, 60)),
-            updated_at              INTEGER NOT NULL
+                CHECK (usage_refresh_interval_seconds IN (0, 5, 10, 30, 60))
         );
 
         CREATE TABLE account_data (
             record_id       TEXT PRIMARY KEY NOT NULL,
+            created_at      INTEGER NOT NULL,
+            updated_at      INTEGER NOT NULL,
             profile_id      TEXT NOT NULL,
             provider_id     TEXT,
             record_kind     TEXT NOT NULL,
             value           BLOB NOT NULL,
-            created_at      INTEGER NOT NULL,
-            updated_at      INTEGER NOT NULL,
             FOREIGN KEY(provider_id) REFERENCES providers(id) ON DELETE CASCADE
         );
 
@@ -87,16 +88,16 @@ const MIGRATIONS: &[Migration] = &[Migration {
 
         CREATE TABLE usage_events (
             platform                 TEXT NOT NULL CHECK (platform IN ('codex', 'claude_code', 'claude_desktop')),
+            occurred_at              INTEGER NOT NULL,
+            created_at               INTEGER NOT NULL,
             event_id                 TEXT NOT NULL,
             model                    TEXT,
-            occurred_at              INTEGER NOT NULL,
             uncached_input           INTEGER NOT NULL CHECK (uncached_input >= 0),
             cache_read               INTEGER NOT NULL CHECK (cache_read >= 0),
             cache_write              INTEGER NOT NULL CHECK (cache_write >= 0),
             output                   INTEGER NOT NULL CHECK (output >= 0),
             reasoning_output         INTEGER NOT NULL CHECK (reasoning_output >= 0),
             request_count            INTEGER NOT NULL CHECK (request_count >= 0),
-            created_at               INTEGER NOT NULL,
             PRIMARY KEY(platform, event_id)
         );
 
@@ -108,12 +109,12 @@ const MIGRATIONS: &[Migration] = &[Migration {
 
         CREATE TABLE usage_sources (
             platform                 TEXT NOT NULL CHECK (platform IN ('codex', 'claude_code', 'claude_desktop')),
+            modified_at              INTEGER NOT NULL,
+            scanned_at               INTEGER NOT NULL,
             source_path              TEXT NOT NULL,
             file_size                INTEGER NOT NULL CHECK (file_size >= 0),
-            modified_at              INTEGER NOT NULL,
             fingerprint              TEXT NOT NULL,
             malformed_records        INTEGER NOT NULL DEFAULT 0 CHECK (malformed_records >= 0),
-            scanned_at               INTEGER NOT NULL,
             PRIMARY KEY(platform, source_path)
         );
 
@@ -131,44 +132,55 @@ const MIGRATIONS: &[Migration] = &[Migration {
 
         CREATE TABLE usage_scan_summary (
             platform                 TEXT NOT NULL CHECK (platform IN ('codex', 'claude_code', 'claude_desktop')),
+            last_scanned_at           INTEGER,
             files_scanned            INTEGER NOT NULL DEFAULT 0 CHECK (files_scanned >= 0),
             malformed_records        INTEGER NOT NULL DEFAULT 0 CHECK (malformed_records >= 0),
             duplicate_records        INTEGER NOT NULL DEFAULT 0 CHECK (duplicate_records >= 0),
             coverage_start           INTEGER,
             coverage_end             INTEGER,
-            last_scanned_at           INTEGER,
             is_partial               INTEGER NOT NULL DEFAULT 0 CHECK (is_partial IN (0, 1)),
             PRIMARY KEY(platform)
         );
 
         CREATE TABLE history_sources (
             scope                     TEXT NOT NULL CHECK (scope IN ('codex', 'claude_code', 'claude_desktop_code')),
+            modified_at               INTEGER NOT NULL,
+            processed_at              INTEGER NOT NULL,
             root_id                   TEXT NOT NULL,
             source_path               TEXT NOT NULL,
             session_key               TEXT NOT NULL,
             file_size                 INTEGER NOT NULL CHECK (file_size >= 0),
-            modified_at               INTEGER NOT NULL,
             fingerprint               TEXT NOT NULL,
-            processed_at              INTEGER NOT NULL,
             PRIMARY KEY(scope, root_id, source_path)
         );
 
         CREATE TABLE history_sync_status (
             scope                     TEXT PRIMARY KEY NOT NULL CHECK (scope IN ('codex', 'claude_code', 'claude_desktop_code')),
+            last_completed_at          INTEGER,
             state                     TEXT NOT NULL,
             processed_files           INTEGER NOT NULL DEFAULT 0,
-            last_completed_at          INTEGER,
             error_summary             TEXT
         );
     "#,
-}];
+    },
+    Migration {
+        version: 2,
+        name: "usage_source_cursors",
+        sql: r#"
+            ALTER TABLE usage_sources
+                ADD COLUMN cursor_offset INTEGER CHECK (cursor_offset IS NULL OR cursor_offset >= 0);
+            ALTER TABLE usage_sources
+                ADD COLUMN parser_state TEXT;
+        "#,
+    },
+];
 
 pub(super) fn apply(connection: &mut Connection) -> Result<(), DbError> {
     connection.execute_batch(
         "CREATE TABLE IF NOT EXISTS schema_migrations ( \
              version INTEGER PRIMARY KEY NOT NULL, \
-             name TEXT NOT NULL, \
-             applied_at INTEGER NOT NULL \
+             applied_at INTEGER NOT NULL, \
+             name TEXT NOT NULL \
          );",
     )?;
 

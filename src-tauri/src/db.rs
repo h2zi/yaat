@@ -1023,8 +1023,23 @@ pub struct UsageSourceInput {
     pub modified_at: i64,
     pub fingerprint: String,
     pub malformed_records: u64,
+    pub cursor_offset: Option<u64>,
+    pub parser_state: Option<String>,
+    pub append_only: bool,
     pub records: Vec<UsageRecordInput>,
 }
+
+#[derive(Clone, Debug)]
+pub struct UsageSourceState {
+    pub file_size: u64,
+    pub modified_at: i64,
+    pub fingerprint: String,
+    pub malformed_records: u64,
+    pub cursor_offset: Option<u64>,
+    pub parser_state: Option<String>,
+}
+
+type UsageSourceRow = (i64, i64, String, i64, Option<i64>, Option<String>);
 
 #[derive(Clone, Debug)]
 pub struct HistorySourceState {
@@ -1113,25 +1128,49 @@ impl Repository {
         Ok(())
     }
 
-    pub fn usage_source_matches(
+    pub fn usage_source_state(
         &self,
         platform: Platform,
         source_path: &str,
-        file_size: u64,
-        modified_at: i64,
-    ) -> Result<bool, DbError> {
+    ) -> Result<Option<UsageSourceState>, DbError> {
         let connection = self.lock()?;
-        let stored: Option<(i64, i64)> = connection
+        let stored: Option<UsageSourceRow> = connection
             .query_row(
-                "SELECT file_size, modified_at FROM usage_sources \
+                "SELECT file_size, modified_at, fingerprint, malformed_records, \
+                        cursor_offset, parser_state FROM usage_sources \
                  WHERE platform = ?1 AND source_path = ?2",
                 params![platform.as_str(), source_path],
-                |row| Ok((row.get(0)?, row.get(1)?)),
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                    ))
+                },
             )
             .optional()?;
-        Ok(stored.is_some_and(|(size, modified)| {
-            size == i64::try_from(file_size).unwrap_or(-1) && modified == modified_at
-        }))
+        stored
+            .map(
+                |(file_size, modified_at, fingerprint, malformed, cursor, parser_state)| {
+                    Ok(UsageSourceState {
+                        file_size: count_from_db(file_size, "usage_source.file_size")?,
+                        modified_at,
+                        fingerprint,
+                        malformed_records: count_from_db(
+                            malformed,
+                            "usage_source.malformed_records",
+                        )?,
+                        cursor_offset: cursor
+                            .map(|value| count_from_db(value, "usage_source.cursor_offset"))
+                            .transpose()?,
+                        parser_state,
+                    })
+                },
+            )
+            .transpose()
     }
 
     pub fn merge_usage_sources(
@@ -1146,12 +1185,14 @@ impl Repository {
         for source in sources {
             transaction.execute(
                 "INSERT INTO usage_sources( \
-                    platform, source_path, file_size, modified_at, fingerprint, malformed_records, scanned_at \
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7) \
+                    platform, source_path, file_size, modified_at, fingerprint, malformed_records, \
+                    scanned_at, cursor_offset, parser_state \
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9) \
                  ON CONFLICT(platform, source_path) DO UPDATE SET \
                     file_size = excluded.file_size, modified_at = excluded.modified_at, \
                     fingerprint = excluded.fingerprint, malformed_records = excluded.malformed_records, \
-                    scanned_at = excluded.scanned_at",
+                    scanned_at = excluded.scanned_at, cursor_offset = excluded.cursor_offset, \
+                    parser_state = excluded.parser_state",
                 params![
                     platform.as_str(),
                     source.source_path,
@@ -1160,12 +1201,19 @@ impl Repository {
                     source.fingerprint,
                     count_to_db(source.malformed_records, "usage_source.malformed_records")?,
                     now,
+                    source
+                        .cursor_offset
+                        .map(|value| count_to_db(value, "usage_source.cursor_offset"))
+                        .transpose()?,
+                    source.parser_state,
                 ],
             )?;
-            transaction.execute(
-                "DELETE FROM usage_event_sources WHERE platform = ?1 AND source_path = ?2",
-                params![platform.as_str(), source.source_path],
-            )?;
+            if !source.append_only {
+                transaction.execute(
+                    "DELETE FROM usage_event_sources WHERE platform = ?1 AND source_path = ?2",
+                    params![platform.as_str(), source.source_path],
+                )?;
+            }
             for usage in &source.records {
                 if usage.platform != platform || usage.source_path != source.source_path {
                     return Err(DbError::InvalidInput(
@@ -1792,6 +1840,16 @@ mod tests {
         Repository::in_memory().unwrap()
     }
 
+    fn column_names(connection: &Connection, table: &str) -> Vec<String> {
+        connection
+            .prepare(&format!("PRAGMA table_info({table})"))
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(1))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap()
+    }
+
     fn create_provider(
         repository: &Repository,
         platform: Platform,
@@ -1910,7 +1968,7 @@ mod tests {
     }
 
     #[test]
-    fn migration_creates_the_minimal_v1_schema_and_defaults() {
+    fn migration_creates_the_current_schema_and_defaults() {
         let repository = repository();
         let connection = repository.lock().unwrap();
         let mut statement = connection
@@ -1940,6 +1998,46 @@ mod tests {
         assert!(!tables.contains("managed_fields"));
         assert!(!tables.contains("switch_operations"));
         drop(statement);
+        for (table, expected_prefix) in [
+            ("providers", &["id", "created_at", "updated_at"][..]),
+            ("platform_bindings", &["platform", "updated_at"][..]),
+            ("settings", &["singleton_id", "updated_at"][..]),
+            (
+                "account_data",
+                &["record_id", "created_at", "updated_at"][..],
+            ),
+            (
+                "usage_events",
+                &["platform", "occurred_at", "created_at"][..],
+            ),
+            (
+                "usage_sources",
+                &["platform", "modified_at", "scanned_at"][..],
+            ),
+            ("usage_scan_summary", &["platform", "last_scanned_at"][..]),
+            (
+                "history_sources",
+                &["scope", "modified_at", "processed_at"][..],
+            ),
+            ("history_sync_status", &["scope", "last_completed_at"][..]),
+            ("schema_migrations", &["version", "applied_at"][..]),
+        ] {
+            let columns = column_names(&connection, table);
+            let actual_prefix = columns
+                .iter()
+                .take(expected_prefix.len())
+                .map(String::as_str)
+                .collect::<Vec<_>>();
+            assert_eq!(
+                actual_prefix, expected_prefix,
+                "timestamp columns must stay near the identity in {table}"
+            );
+        }
+        let usage_source_columns = column_names(&connection, "usage_sources")
+            .into_iter()
+            .collect::<BTreeSet<_>>();
+        assert!(usage_source_columns.contains("cursor_offset"));
+        assert!(usage_source_columns.contains("parser_state"));
         drop(connection);
 
         let settings = repository.load_settings().unwrap();
@@ -1958,6 +2056,42 @@ mod tests {
                 }
             );
         }
+    }
+
+    #[test]
+    fn usage_cursor_migration_preserves_existing_source_rows() {
+        let mut connection = Connection::open_in_memory().unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY, applied_at INTEGER NOT NULL, name TEXT NOT NULL); \
+                 INSERT INTO schema_migrations VALUES (1, 1, 'initial_store'); \
+                 CREATE TABLE usage_sources ( \
+                    platform TEXT NOT NULL, modified_at INTEGER NOT NULL, scanned_at INTEGER NOT NULL, \
+                    source_path TEXT NOT NULL, file_size INTEGER NOT NULL, fingerprint TEXT NOT NULL, \
+                    malformed_records INTEGER NOT NULL, PRIMARY KEY(platform, source_path)); \
+                 INSERT INTO usage_sources VALUES ('codex', 7, 9, '/tmp/rollout.jsonl', 42, 'old', 3);",
+            )
+            .unwrap();
+
+        migrations::apply(&mut connection).unwrap();
+        let row = connection
+            .query_row(
+                "SELECT file_size, fingerprint, malformed_records, cursor_offset, parser_state \
+                 FROM usage_sources WHERE platform = 'codex'",
+                [],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, Option<i64>>(3)?,
+                        row.get::<_, Option<String>>(4)?,
+                    ))
+                },
+            )
+            .unwrap();
+
+        assert_eq!(row, (42, "old".into(), 3, None, None));
     }
 
     #[test]

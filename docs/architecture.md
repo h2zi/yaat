@@ -144,13 +144,13 @@ Claude Desktop 快照包含账号 UUID、两套解密后的 OAuth Cache，以及
 
 - Codex：`sessions`、`archived_sessions`、`.jsonl`、`.jsonl.zst`。
 - Claude Code：`projects` JSONL，处理子代理、重放、初步 / 最终批次和缓存 Token。
-- 源文件按路径、大小、mtime 和指纹增量索引；复制历史的同一逻辑事件只统计一次。查询最长 366 天并按 IANA 时区聚合，支持模型过滤、自动刷新和缓存命中率。
+- 普通 JSONL 保存完整换行处的字节游标和尾部指纹，只解析后续追加记录；截断或改写时全量重建，Zstd 归档始终全量流式解析。复制历史的同一物理 rollout 事件只统计一次。查询最长 366 天并按 IANA 时区聚合，支持模型过滤、自动刷新和缓存命中率。
 - Claude Desktop 与远程配额不在第一版统计范围。
 
 ## 会话历史
 
 - 扫描不跟随目录中的符号链接，但允许用户配置的历史根本身是正常符号链接。
-- 同名同内容跳过；缺失会话复制；一份会话严格扩展其他所有版本时使用最长版本更新目标；真正分叉报告冲突且不覆盖。
+- 同名同内容跳过；缺失会话复制；同一物理文件严格扩展旧版本时使用最长版本更新目标；真正分叉报告冲突且不覆盖。Codex edit/revert 产生的多个 rollout 文件即使共享逻辑 thread ID，也作为独立文件同步。
 - Codex 首次统一和“重新统一”会幂等修正 JSONL / Zstd 中的两处 provider 元数据与 `state_5.sqlite.threads.model_provider`，统一为 `custom`；启用后不可关闭。
 - Claude Code 只同步各配置根的 `projects` JSONL。
 - Claude Desktop 只处理 `claude-code-sessions/<账号>/<组织>/local_*.json`，目标必须来自扫描结果；Chat / Cowork 不参与。
@@ -164,4 +164,4 @@ Claude Desktop 快照包含账号 UUID、两套解密后的 OAuth Cache，以及
 
 ## Docker 验证
 
-`docker/app-build.Dockerfile` 在容器内执行 workspace check、Clippy、`-D warnings` Rust 文档、Rust 测试、TypeScript/Vite 构建和 Tauri 无 bundle 构建；`docker/windows-check.Dockerfile` 交叉检查 `x86_64-pc-windows-gnu` 的全部 Rust targets。`scripts/test-codex-docker.sh` 使用 Codex `0.147.0` 和容器内 mock Responses 服务验证严格配置、直接凭据、官方账号字段复制和无关配置保留；Claude Code 互操作基线是 `2.1.226`。容器运行阶段禁网并移除 capabilities。
+`docker/app-build.Dockerfile` 在容器内执行 workspace check、Clippy、`-D warnings` Rust 文档、Rust 测试、TypeScript/Vite 构建和 Tauri 无 bundle 构建；`docker/windows-check.Dockerfile` 交叉检查 `x86_64-pc-windows-gnu` 的全部 Rust targets。`scripts/test-codex-docker.sh` 使用 Codex `0.153.2` 和容器内 mock Responses 服务验证严格配置、直接凭据、官方账号字段复制和无关配置保留；Claude Code 互操作基线是 `2.1.260`。容器运行阶段禁网并移除 capabilities。

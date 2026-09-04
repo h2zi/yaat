@@ -621,7 +621,7 @@ fn load_history_cache(
 
 fn cached_snapshot(
     cache: Option<&HashMap<(String, String), HistorySourceState>>,
-    _scope: HistoryScope,
+    scope: HistoryScope,
     root_index: usize,
     root: &HistoryRoot,
     path: &Path,
@@ -646,7 +646,11 @@ fn cached_snapshot(
         root_index,
         path: path.to_path_buf(),
         relative_path: relative_path.to_path_buf(),
-        key: cached.session_key.clone(),
+        key: if scope == HistoryScope::Codex {
+            canonical_codex_key(path)?
+        } else {
+            cached.session_key.clone()
+        },
         normalized_fingerprint: Some(fingerprint),
         needs_metadata_update: false,
     }))
@@ -725,10 +729,10 @@ fn codex_snapshot(
     let needs_metadata_update = normalized
         .as_deref()
         .is_some_and(|normalized| decoded.as_deref() != Some(normalized));
-    let key = decoded
-        .as_deref()
-        .and_then(codex_session_id)
-        .unwrap_or(canonical_codex_key(path)?);
+    // A logical Codex thread can now have more than one physical rollout
+    // after edit/revert. Keep those branch files independent while still
+    // matching active and archived copies by their stable file name.
+    let key = canonical_codex_key(path)?;
     Ok(FileSnapshot {
         root_index,
         path: path.to_path_buf(),
@@ -863,28 +867,6 @@ fn normalize_codex_jsonl(bytes: &[u8]) -> Result<Vec<u8>, ()> {
     }
 
     saw_session_meta.then_some(output).ok_or(())
-}
-
-fn codex_session_id(bytes: &[u8]) -> Option<String> {
-    let text = std::str::from_utf8(bytes).ok()?;
-    for line in text.lines() {
-        if !line.contains("\"session_meta\"") {
-            continue;
-        }
-        let value: Value = serde_json::from_str(line).ok()?;
-        if value.get("type").and_then(Value::as_str) != Some("session_meta") {
-            continue;
-        }
-        let id = value
-            .get("payload")
-            .and_then(|payload| payload.get("id"))
-            .and_then(Value::as_str)?
-            .trim();
-        if !id.is_empty() && id.len() <= 128 && !id.chars().any(char::is_control) {
-            return Some(id.to_owned());
-        }
-    }
-    None
 }
 
 fn plan_copies(state: &ScanState, target_index: Option<usize>) -> AppResult<CopyPlan> {
@@ -1627,21 +1609,19 @@ mod tests {
     }
 
     #[test]
-    fn codex_session_id_is_stable_across_different_rollout_paths() {
+    fn codex_rollout_branches_with_one_session_id_copy_independently() {
         let temp = tempfile::tempdir().unwrap();
         let first = temp.path().join("first");
         let second = temp.path().join("second");
-        let first_path = first.join("sessions/2026/08/03/rollout-new-name.jsonl");
-        let second_path = second.join("archived_sessions/rollout-old-name.jsonl");
-        fs::create_dir_all(first_path.parent().unwrap()).unwrap();
-        fs::create_dir_all(second_path.parent().unwrap()).unwrap();
-        let old = codex_line(CODEX_HISTORY_PROVIDER_ID);
-        let mut extended = old.clone();
-        extended.extend_from_slice(
-            b"{\"type\":\"event_msg\",\"payload\":{\"type\":\"user_message\",\"message\":\"continued\"}}\n",
-        );
-        fs::write(&first_path, &extended).unwrap();
-        fs::write(&second_path, &old).unwrap();
+        let original = Path::new("sessions/2026/08/03/rollout-thread.jsonl");
+        let branch = Path::new("sessions/2026/08/03/rollout-thread_branch.jsonl");
+        for (relative, marker) in [(original, "original"), (branch, "branch")] {
+            let path = first.join(relative);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            let mut bytes = codex_line(CODEX_HISTORY_PROVIDER_ID);
+            bytes.extend_from_slice(format!("{{\"marker\":\"{marker}\"}}\n").as_bytes());
+            fs::write(path, bytes).unwrap();
+        }
 
         let result = apply(
             HistoryScope::Codex,
@@ -1650,9 +1630,18 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(result.copied, 1);
+        assert_eq!(result.copied, 2);
         assert_eq!(result.conflicts, 0);
-        assert_eq!(fs::read(second_path).unwrap(), extended);
+        assert!(
+            fs::read_to_string(second.join(original))
+                .unwrap()
+                .contains("original")
+        );
+        assert!(
+            fs::read_to_string(second.join(branch))
+                .unwrap()
+                .contains("branch")
+        );
     }
 
     #[test]

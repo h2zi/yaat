@@ -342,7 +342,7 @@ fn main() {
     let adapter = ClaudeAdapter::new();
     let program = adapter.resolve_cli(&context).unwrap();
     let version = adapter.cli_version(&program).unwrap();
-    assert_eq!(version, "2.1.226");
+    assert_eq!(version, "2.1.260");
 
     let runtime = ProfileRuntime {
         profile: &profile,
